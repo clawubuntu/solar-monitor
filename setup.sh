@@ -1,8 +1,6 @@
 #!/bin/bash
-"""
-Solar Monitor Setup Script
-Run this on the Raspberry Pi to start the platform
-"""
+# Solar Monitor Setup Script
+# Run this on the Raspberry Pi to start the platform
 set -e
 
 echo "=== Solar Monitor Setup ==="
