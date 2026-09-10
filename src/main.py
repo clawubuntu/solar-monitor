@@ -9,6 +9,7 @@ import time
 import os
 import html
 import logging
+import base64
 from typing import Dict, List, Optional
 from contextlib import asynccontextmanager
 
@@ -70,6 +71,8 @@ async def lifespan(app: FastAPI):
             device=config["device"],
             name=config.get("name", ""),
             baudrate=config.get("baudrate", 9600),
+            parity=config.get("parity", "N"),
+            stopbits=config.get("stopbits", 1),
             protocol=ProtocolType(config.get("protocol", "modbus_rtu")),
             inverter_type=config.get("inverter_type", "generic"),
             device_fingerprint=config.get("device_fingerprint", ""),
@@ -120,7 +123,17 @@ async def add_port(config: Dict):
         name=config.get("name", "")
     )
     if serial_manager.add_port(port):
-        db.save_port_config(config)
+        db.save_port_config({
+            "device": port.device,
+            "name": port.name,
+            "baudrate": port.baudrate,
+            "parity": port.parity,
+            "stopbits": port.stopbits,
+            "protocol": port.protocol.value,
+            "inverter_type": port.inverter_type,
+            "device_fingerprint": port.device_fingerprint,
+            "max_stale_seconds": port.max_stale_seconds,
+        })
         db.log_audit("port_added", config["device"], f"Name: {config.get('name', '')}")
         return {"status": "ok", "message": f"Port {port.device} added"}
     raise HTTPException(status_code=400, detail="Port already exists")
@@ -134,9 +147,11 @@ async def remove_port(device: str):
 
 @app.post("/api/ports/{device:path}/open")
 async def open_port(device: str):
-    """Open a serial port."""
+    """Open a serial port and start its reader task."""
     if serial_manager.open_port(device):
         db.log_audit("port_opened", device)
+        # Start a reader task for this port
+        asyncio.create_task(serial_manager.read_port(device, on_reading))
         return {"status": "ok", "message": f"Port {device} opened"}
     raise HTTPException(status_code=400, detail="Failed to open port")
 
@@ -154,6 +169,10 @@ async def get_readings(port_name: str = None, limit: int = 100):
         readings = db.get_readings(port_name=port_name, limit=limit)
     else:
         readings = db.get_latest_readings(limit)
+    # Encode binary data as hex for JSON serialization
+    for r in readings:
+        if r.get("raw_data"):
+            r["raw_data"] = base64.b64encode(r["raw_data"]).decode("ascii")
     return readings
 
 @app.get("/api/readings/history")
@@ -167,6 +186,10 @@ async def get_history(port_name: str = None, hours: int = 24):
         end_time=end_time,
         limit=10000
     )
+    # Encode binary data as hex for JSON serialization
+    for r in readings:
+        if r.get("raw_data"):
+            r["raw_data"] = base64.b64encode(r["raw_data"]).decode("ascii")
     return readings
 
 @app.get("/api/stats")
@@ -230,16 +253,18 @@ async def control_inverter(device: str, command: Dict):
     port = serial_manager.ports[device]
     profile = get_profile(port.inverter_type)
     
-    # Check register limits
+    # Check register limits - REJECT unknown registers
     reg_map = profile.get_register_map()
-    if register in reg_map:
-        reg = reg_map[register]
-        if not reg.writable:
-            raise HTTPException(status_code=400, detail="Register is read-only")
-        if reg.min_value is not None and value < reg.min_value:
-            raise HTTPException(status_code=400, detail=f"Value below minimum ({reg.min_value})")
-        if reg.max_value is not None and value > reg.max_value:
-            raise HTTPException(status_code=400, detail=f"Value above maximum ({reg.max_value})")
+    if register not in reg_map:
+        raise HTTPException(status_code=400, detail=f"Unknown register {register} for profile {port.inverter_type}")
+    
+    reg = reg_map[register]
+    if not reg.writable:
+        raise HTTPException(status_code=400, detail="Register is read-only")
+    if reg.min_value is not None and value < reg.min_value:
+        raise HTTPException(status_code=400, detail=f"Value below minimum ({reg.min_value})")
+    if reg.max_value is not None and value > reg.max_value:
+        raise HTTPException(status_code=400, detail=f"Value above maximum ({reg.max_value})")
     
     # Build Modbus write command
     slave_id = profile.slave_id
@@ -295,6 +320,10 @@ async def websocket_endpoint(websocket: WebSocket):
     try:
         while True:
             readings = db.get_latest_readings(10)
+            # Encode binary data as hex for JSON serialization
+            for r in readings:
+                if r.get("raw_data"):
+                    r["raw_data"] = base64.b64encode(r["raw_data"]).decode("ascii")
             await websocket.send_json({
                 "type": "readings",
                 "data": readings,
@@ -304,49 +333,51 @@ async def websocket_endpoint(websocket: WebSocket):
     except WebSocketDisconnect:
         ws_manager.disconnect(websocket)
 
-# Background task to read from all ports
-async def read_all_ports():
-    """Read from all open ports and store data."""
-    async def on_reading(reading: InverterReading):
-        # Validate reading before storing
-        if reading.valid and reading.metrics:
-            # Check for invalid values (NaN, Inf)
-            for key, value in reading.metrics.items():
-                if isinstance(value, float) and (value != value or value == float('inf') or value == float('-inf')):
-                    reading.valid = False
-                    reading.error = f"Invalid value for {key}"
-                    break
-        
-        db.store_reading({
+# Background task callback for handling readings
+async def on_reading(reading: InverterReading):
+    """Callback for when a reading is received from any port."""
+    # Validate reading before storing
+    if reading.valid and reading.metrics:
+        # Check for invalid values (NaN, Inf)
+        for key, value in reading.metrics.items():
+            if isinstance(value, float) and (value != value or value == float('inf') or value == float('-inf')):
+                reading.valid = False
+                reading.error = f"Invalid value for {key}"
+                break
+    
+    db.store_reading({
+        "timestamp": reading.timestamp,
+        "port_name": reading.port_name,
+        "device_id": reading.device_id,
+        "device_type": reading.device_type,
+        "metrics": reading.metrics,
+        "raw_data": reading.raw_data,
+        "valid": reading.valid,
+        "error": reading.error,
+        "health": reading.health.value
+    })
+    
+    # Evaluate automations (only with valid data)
+    if reading.valid:
+        readings_dict = {reading.port_name: reading.metrics}
+        automation_engine.evaluate_rules(readings_dict)
+    
+    await ws_manager.broadcast({
+        "type": "reading",
+        "data": {
             "timestamp": reading.timestamp,
             "port_name": reading.port_name,
             "device_id": reading.device_id,
             "device_type": reading.device_type,
             "metrics": reading.metrics,
-            "raw_data": reading.raw_data,
             "valid": reading.valid,
-            "error": reading.error,
             "health": reading.health.value
-        })
-        
-        # Evaluate automations (only with valid data)
-        if reading.valid:
-            readings_dict = {reading.port_name: reading.metrics}
-            automation_engine.evaluate_rules(readings_dict)
-        
-        await ws_manager.broadcast({
-            "type": "reading",
-            "data": {
-                "timestamp": reading.timestamp,
-                "port_name": reading.port_name,
-                "device_id": reading.device_id,
-                "device_type": reading.device_type,
-                "metrics": reading.metrics,
-                "valid": reading.valid,
-                "health": reading.health.value
-            }
-        })
-    
+        }
+    })
+
+# Background task to read from all ports
+async def read_all_ports():
+    """Read from all open ports and store data."""
     await serial_manager.start(on_reading)
 
 if __name__ == "__main__":

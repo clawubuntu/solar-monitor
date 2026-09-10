@@ -13,10 +13,13 @@ import json
 import os
 import hashlib
 import logging
+import struct
 from typing import Dict, List, Optional, Callable, Any
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+
+from modbus_handler import ModbusRTU, get_profile, InverterProfile
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +55,7 @@ class SerialPort:
     error_count: int = 0
     total_reads: int = 0
     serial_conn: Optional[serial.Serial] = None
-    device_fingerprint: str = ""  # Persistent identity
+    device_fingerprint: str = ""
     health: DeviceHealth = DeviceHealth.DISCONNECTED
     max_stale_seconds: float = 30.0
 
@@ -78,7 +81,7 @@ class InverterReading:
     timestamp: float
     port_name: str
     device_id: str
-    device_type: str  # "inverter", "bms", "meter"
+    device_type: str
     metrics: Dict[str, float]
     raw_data: bytes = b""
     valid: bool = True
@@ -132,6 +135,8 @@ class SerialPortManager:
                     "device": p.device,
                     "name": p.name,
                     "baudrate": p.baudrate,
+                    "parity": p.parity,
+                    "stopbits": p.stopbits,
                     "protocol": p.protocol.value,
                     "inverter_type": p.inverter_type,
                     "device_fingerprint": p.device_fingerprint,
@@ -193,7 +198,8 @@ class SerialPortManager:
             )
             port.is_open = True
             port.error_count = 0
-            port.health = DeviceHealth.HEALTHY
+            # Don't mark as HEALTHY until we receive valid data
+            port.health = DeviceHealth.DISCONNECTED
             return True
         except Exception as e:
             port.error_count += 1
@@ -223,25 +229,85 @@ class SerialPortManager:
             self.close_port(device)
 
     async def read_port(self, device: str, callback: Optional[Callable] = None):
-        """Continuously read from a single port with health monitoring."""
+        """
+        Continuously read from a single port with health monitoring.
+        Sends Modbus requests, assembles responses, validates CRC,
+        decodes registers, and publishes readings.
+        """
         port = self.ports[device]
+        profile = get_profile(port.inverter_type)
+        
         while self._running and port.is_open:
             try:
+                # Send Modbus read request
+                if port.serial_conn and port.serial_conn.in_waiting == 0:
+                    slave_id = profile.slave_id
+                    # Read all registers from the profile
+                    if profile.registers:
+                        start_addr = min(r.address for r in profile.registers)
+                        count = max(r.address for r in profile.registers) - start_addr + 1
+                        request = ModbusRTU.build_read_holding_registers(slave_id, start_addr, count)
+                        port.serial_conn.write(request)
+                
+                # Wait for response
+                await asyncio.sleep(0.1)
+                
                 if port.serial_conn and port.serial_conn.in_waiting > 0:
                     data = port.serial_conn.read(port.serial_conn.in_waiting)
                     port.last_read = time.time()
                     port.total_reads += 1
-
-                    reading = InverterReading(
-                        timestamp=time.time(),
-                        port_name=port.name,
-                        device_id=port.device_fingerprint,
-                        device_type=port.inverter_type,
-                        metrics={},
-                        raw_data=data,
-                        valid=True,
-                        health=DeviceHealth.HEALTHY,
-                    )
+                    
+                    # Parse Modbus response
+                    parsed = ModbusRTU.parse_response(data)
+                    
+                    if parsed and not parsed.get("error"):
+                        # Decode registers
+                        register_map = profile.get_register_map()
+                        start_addr = min(r.address for r in profile.registers) if profile.registers else 0
+                        metrics = ModbusRTU.decode_registers(
+                            parsed.get("registers", []),
+                            register_map,
+                            start_addr
+                        )
+                        
+                        # Validate decoded values
+                        valid = True
+                        error_msg = ""
+                        for key, value in metrics.items():
+                            if isinstance(value, float) and (value != value or value == float('inf') or value == float('-inf')):
+                                valid = False
+                                error_msg = f"Invalid value for {key}"
+                                break
+                        
+                        if valid and metrics:
+                            port.last_valid_read = time.time()
+                            port.health = DeviceHealth.HEALTHY
+                        
+                        reading = InverterReading(
+                            timestamp=time.time(),
+                            port_name=port.name,
+                            device_id=port.device_fingerprint,
+                            device_type=port.inverter_type,
+                            metrics=metrics,
+                            raw_data=data,
+                            valid=valid,
+                            error=error_msg,
+                            health=port.health,
+                        )
+                    else:
+                        # Parse error or invalid response
+                        reading = InverterReading(
+                            timestamp=time.time(),
+                            port_name=port.name,
+                            device_id=port.device_fingerprint,
+                            device_type=port.inverter_type,
+                            metrics={},
+                            raw_data=data,
+                            valid=False,
+                            error="Invalid or error response",
+                            health=DeviceHealth.ERROR,
+                        )
+                    
                     self._add_reading(reading)
                     if callback:
                         await callback(reading)
@@ -249,7 +315,8 @@ class SerialPortManager:
                     # Check staleness
                     if port.last_valid_read > 0 and (time.time() - port.last_valid_read) > port.max_stale_seconds:
                         port.health = DeviceHealth.STALE
-                    await asyncio.sleep(0.01)
+                    await asyncio.sleep(0.5)
+                    
             except Exception as e:
                 port.error_count += 1
                 port.health = DeviceHealth.ERROR
@@ -264,6 +331,8 @@ class SerialPortManager:
                     health=DeviceHealth.ERROR,
                 )
                 self._add_reading(reading)
+                if callback:
+                    await callback(reading)
                 await asyncio.sleep(1)
 
     def _add_reading(self, reading: InverterReading):
@@ -273,13 +342,23 @@ class SerialPortManager:
             self.readings = self.readings[-self.max_history:]
 
     async def start(self, callback: Optional[Callable] = None):
-        """Start reading from all open ports."""
+        """
+        Start reading from all ports.
+        Opens all registered ports first, then creates reader tasks.
+        """
         self._running = True
         self._tasks = []
+        
+        # Open all ports first
+        for device in self.ports:
+            self.open_port(device)
+        
+        # Create reader tasks for all open ports
         for device in self.ports:
             if self.ports[device].is_open:
                 task = asyncio.create_task(self.read_port(device, callback))
                 self._tasks.append(task)
+        
         await asyncio.gather(*self._tasks, return_exceptions=True)
 
     async def stop(self):

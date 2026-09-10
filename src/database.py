@@ -39,6 +39,8 @@ class SolarDatabase:
                     device TEXT UNIQUE NOT NULL,
                     name TEXT,
                     baudrate INTEGER DEFAULT 9600,
+                    parity TEXT DEFAULT 'N',
+                    stopbits INTEGER DEFAULT 1,
                     protocol TEXT DEFAULT 'modbus_rtu',
                     inverter_type TEXT DEFAULT 'generic',
                     is_open INTEGER DEFAULT 0,
@@ -131,7 +133,7 @@ class SolarDatabase:
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(query, params).fetchall()
-            return [dict(row) for row in rows]
+            return [self._format_reading(dict(row)) for row in rows]
     
     def get_latest_readings(self, count: int = 100) -> List[Dict]:
         """Get latest readings across all ports."""
@@ -142,7 +144,20 @@ class SolarDatabase:
                 ORDER BY timestamp DESC 
                 LIMIT ?
             """, (count,)).fetchall()
-            return [dict(row) for row in rows]
+            return [self._format_reading(dict(row)) for row in rows]
+    
+    def _format_reading(self, row: Dict) -> Dict:
+        """Format a reading row for API response."""
+        # Convert raw_data bytes to hex string for JSON serialization
+        raw_data = row.get("raw_data")
+        if raw_data is not None:
+            if isinstance(raw_data, bytes):
+                row["raw_data"] = raw_data.hex()
+            elif isinstance(raw_data, str):
+                pass  # Already hex string
+        else:
+            row["raw_data"] = ""
+        return row
     
     def get_port_stats(self) -> List[Dict]:
         """Get statistics for each port."""
@@ -161,16 +176,18 @@ class SolarDatabase:
             return [dict(row) for row in rows]
     
     def save_port_config(self, port: Dict):
-        """Save port configuration."""
+        """Save port configuration with all settings."""
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("""
                 INSERT OR REPLACE INTO ports 
-                (device, name, baudrate, protocol, inverter_type, device_fingerprint, max_stale_seconds)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                (device, name, baudrate, parity, stopbits, protocol, inverter_type, device_fingerprint, max_stale_seconds)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 port["device"],
                 port.get("name", ""),
                 port.get("baudrate", 9600),
+                port.get("parity", "N"),
+                port.get("stopbits", 1),
                 port.get("protocol", "modbus_rtu"),
                 port.get("inverter_type", "generic"),
                 port.get("device_fingerprint", ""),

@@ -88,14 +88,15 @@ class ModbusRTU:
     @staticmethod
     def build_write_single_register(slave_id: int, addr: int, value: int) -> bytes:
         """Build Modbus RTU write single register request."""
-        pdu = struct.pack(">BHHH", 0x06, addr, value)
+        # FIX: was ">BHHH" (expects 4 values), now ">BHH" (3 values: func_code, addr, value)
+        pdu = struct.pack(">BHH", 0x06, addr, value)
         frame = struct.pack("B", slave_id) + pdu
         crc = ModbusRTU.calculate_crc(frame)
         return frame + crc
     
     @staticmethod
     def parse_response(frame: bytes) -> Optional[Dict]:
-        """Parse Modbus RTU response."""
+        """Parse Modbus RTU response with strict validation."""
         if len(frame) < 5:
             return None
         
@@ -122,6 +123,13 @@ class ModbusRTU:
         # Parse holding/input registers response
         if function_code in (0x03, 0x04):
             byte_count = frame[2]
+            # Validate: frame size must match byte_count
+            expected_len = 3 + byte_count + 2  # slave + func + count + data + crc
+            if len(frame) != expected_len:
+                return None
+            # byte_count must be even (registers are 2 bytes each)
+            if byte_count % 2 != 0:
+                return None
             registers = []
             for i in range(byte_count // 2):
                 value = struct.unpack(">H", frame[3 + i*2:5 + i*2])[0]
@@ -135,6 +143,9 @@ class ModbusRTU:
         
         # Parse write response
         if function_code == 0x06:
+            # Write response is 8 bytes: slave(1) + func(1) + addr(2) + value(2) + crc(2)
+            if len(frame) != 8:
+                return None
             addr = struct.unpack(">H", frame[2:4])[0]
             value = struct.unpack(">H", frame[4:6])[0]
             return {
