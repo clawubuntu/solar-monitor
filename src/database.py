@@ -50,6 +50,15 @@ class SolarDatabase:
                     max_stale_seconds REAL DEFAULT 30.0
                 )
             """)
+            # Migration: add columns if missing
+            try:
+                conn.execute("ALTER TABLE ports ADD COLUMN parity TEXT DEFAULT 'N'")
+            except Exception:
+                pass
+            try:
+                conn.execute("ALTER TABLE ports ADD COLUMN stopbits INTEGER DEFAULT 1")
+            except Exception:
+                pass
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS settings (
                     key TEXT PRIMARY KEY,
