@@ -375,6 +375,8 @@ class SerialPortManager:
                 "device": p.device,
                 "name": p.name,
                 "baudrate": p.baudrate,
+                "parity": p.parity,
+                "stopbits": p.stopbits,
                 "protocol": p.protocol.value,
                 "inverter_type": p.inverter_type,
                 "is_open": p.is_open,
