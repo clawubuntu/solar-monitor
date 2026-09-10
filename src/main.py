@@ -97,9 +97,7 @@ templates = Jinja2Templates(directory="templates")
 async def dashboard(request: Request):
     """Main dashboard page with escaped output."""
     return templates.TemplateResponse("dashboard.html", {
-        "request": request,
-        "ports": serial_manager.get_port_status(),
-        "available_ports": serial_manager.list_available_ports()
+        "request": request
     })
 
 @app.get("/api/ports")
