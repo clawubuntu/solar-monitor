@@ -420,7 +420,42 @@ INVERTER_PROFILES = {
             ModbusRegister(2, "power", "W", scale=1),
             ModbusRegister(3, "frequency", "Hz", scale=0.01),
         ]
-    )
+    ),
+    "jk_pb": InverterProfile(
+        name="JK-PB2A16S20P",
+        manufacturer="JK",
+        protocol="modbus_rtu",
+        baudrate=9600,
+        slave_id=1,
+        registers=[
+            # Cell voltages (0x1200-0x120F)
+            ModbusRegister(0x1200, "cell_01_v", "V", scale=0.001, category="battery"),
+            ModbusRegister(0x1201, "cell_02_v", "V", scale=0.001, category="battery"),
+            ModbusRegister(0x1202, "cell_03_v", "V", scale=0.001, category="battery"),
+            ModbusRegister(0x1203, "cell_04_v", "V", scale=0.001, category="battery"),
+            ModbusRegister(0x1204, "cell_05_v", "V", scale=0.001, category="battery"),
+            ModbusRegister(0x1205, "cell_06_v", "V", scale=0.001, category="battery"),
+            ModbusRegister(0x1206, "cell_07_v", "V", scale=0.001, category="battery"),
+            ModbusRegister(0x1207, "cell_08_v", "V", scale=0.001, category="battery"),
+            ModbusRegister(0x1208, "cell_09_v", "V", scale=0.001, category="battery"),
+            ModbusRegister(0x1209, "cell_10_v", "V", scale=0.001, category="battery"),
+            ModbusRegister(0x120A, "cell_11_v", "V", scale=0.001, category="battery"),
+            ModbusRegister(0x120B, "cell_12_v", "V", scale=0.001, category="battery"),
+            ModbusRegister(0x120C, "cell_13_v", "V", scale=0.001, category="battery"),
+            ModbusRegister(0x120D, "cell_14_v", "V", scale=0.001, category="battery"),
+            ModbusRegister(0x120E, "cell_15_v", "V", scale=0.001, category="battery"),
+            ModbusRegister(0x120F, "cell_16_v", "V", scale=0.001, category="battery"),
+            # Battery voltage (0x1290)
+            ModbusRegister(0x1290, "voltage", "V", scale=0.001, category="battery"),
+            # Battery current (0x1294)
+            ModbusRegister(0x1294, "current", "A", scale=0.001, category="battery"),
+            # SOC (0x12A6)
+            ModbusRegister(0x12A6, "soc", "%", scale=1, category="battery"),
+            # Temperature (0x12A0)
+            ModbusRegister(0x12A0, "temp1", "°C", scale=0.1, category="temperature"),
+            ModbusRegister(0x12A1, "temp2", "°C", scale=0.1, category="temperature"),
+        ]
+    ),
 }
 
 def get_profile(name: str) -> InverterProfile:
