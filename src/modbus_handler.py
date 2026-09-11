@@ -428,7 +428,7 @@ INVERTER_PROFILES = {
         baudrate=9600,
         slave_id=1,
         registers=[
-            # Cell voltages (0x1200-0x120F)
+            # Cell voltages (0x1200-0x120F) - 16 registers
             ModbusRegister(0x1200, "cell_01_v", "V", scale=0.001, category="battery"),
             ModbusRegister(0x1201, "cell_02_v", "V", scale=0.001, category="battery"),
             ModbusRegister(0x1202, "cell_03_v", "V", scale=0.001, category="battery"),
@@ -445,15 +445,6 @@ INVERTER_PROFILES = {
             ModbusRegister(0x120D, "cell_14_v", "V", scale=0.001, category="battery"),
             ModbusRegister(0x120E, "cell_15_v", "V", scale=0.001, category="battery"),
             ModbusRegister(0x120F, "cell_16_v", "V", scale=0.001, category="battery"),
-            # Battery voltage (0x1290)
-            ModbusRegister(0x1290, "voltage", "V", scale=0.001, category="battery"),
-            # Battery current (0x1294)
-            ModbusRegister(0x1294, "current", "A", scale=0.001, category="battery"),
-            # SOC (0x12A6)
-            ModbusRegister(0x12A6, "soc", "%", scale=1, category="battery"),
-            # Temperature (0x12A0)
-            ModbusRegister(0x12A0, "temp1", "°C", scale=0.1, category="temperature"),
-            ModbusRegister(0x12A1, "temp2", "°C", scale=0.1, category="temperature"),
         ]
     ),
 }

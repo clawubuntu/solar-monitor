@@ -381,6 +381,9 @@ class SerialPortManager:
         if profile.registers:
             start_addr = min(r.address for r in profile.registers)
             count = max(r.address for r in profile.registers) - start_addr + 1
+            # Limit to 50 registers per read to avoid buffer issues
+            if count > 50:
+                count = 50
         else:
             start_addr = 0
             count = 10
