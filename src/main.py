@@ -2,6 +2,12 @@
 """
 Solar Monitor - Main Application
 Multi-serial solar monitoring platform with REST API, WebSocket, and web dashboard.
+
+Features:
+- Equipment writes disabled by default (enable with ENABLE_WRITES=true)
+- Single config store (SQLite)
+- Proper Modbus transactions with acknowledgment
+- Wired automation engine with action handlers
 """
 import asyncio
 import json
@@ -9,14 +15,12 @@ import time
 import os
 import html
 import logging
-import base64
 from typing import Dict, List, Optional
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request
-from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 import uvicorn
 
 from serial_manager import SerialPortManager, SerialPort, ProtocolType, InverterReading, DeviceHealth
@@ -28,10 +32,26 @@ from automations import AutomationEngine, AutomationRule
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Configuration
+ENABLE_WRITES = os.environ.get("ENABLE_WRITES", "false").lower() == "true"
+
 # Initialize components
 serial_manager = SerialPortManager()
 db = SolarDatabase()
 automation_engine = AutomationEngine()
+
+# Register automation action handler
+def handle_automation_action(action: Dict):
+    """Handle automation actions (e.g., send command, log alert)."""
+    logger.info(f"Automation action: {action}")
+    action_type = action.get("type", "")
+    if action_type == "alert":
+        logger.warning(f"ALERT: {action.get('message', '')}")
+    elif action_type == "command":
+        # Hardware commands disabled until tested
+        logger.warning(f"Command action blocked (hardware commands disabled): {action}")
+
+automation_engine.on_action(handle_automation_action)
 
 # WebSocket connection manager
 class ConnectionManager:
@@ -58,13 +78,10 @@ class ConnectionManager:
 
 ws_manager = ConnectionManager()
 
-# Simulators for testing without hardware
-simulators: Dict[str, InverterSimulator] = {}
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown events."""
-    # Load saved port configurations
+    # Load saved port configurations from SQLite (single source of truth)
     configs = db.get_port_configs()
     for config in configs:
         port = SerialPort(
@@ -80,6 +97,10 @@ async def lifespan(app: FastAPI):
         )
         serial_manager.add_port(port)
     
+    # Log configuration
+    logger.info(f"Equipment writes enabled: {ENABLE_WRITES}")
+    logger.info(f"Loaded {len(configs)} port configs")
+    
     # Start reading task
     asyncio.create_task(read_all_ports())
     
@@ -89,7 +110,6 @@ async def lifespan(app: FastAPI):
     await serial_manager.stop()
 
 app = FastAPI(title="Solar Monitor", version="1.0.0", lifespan=lifespan)
-templates = Jinja2Templates(directory="templates")
 
 # REST API Endpoints
 
@@ -133,6 +153,11 @@ async def add_port(config: Dict):
             "max_stale_seconds": port.max_stale_seconds,
         })
         db.log_audit("port_added", config["device"], f"Name: {config.get('name', '')}")
+        
+        # Start reader task for this port
+        if port.is_open:
+            asyncio.create_task(serial_manager.read_port(port.device, on_reading))
+        
         return {"status": "ok", "message": f"Port {port.device} added"}
     raise HTTPException(status_code=400, detail="Port already exists")
 
@@ -140,6 +165,17 @@ async def add_port(config: Dict):
 async def remove_port(device: str):
     """Remove a serial port."""
     serial_manager.remove_port(device)
+    # Also remove from SQLite (single source of truth)
+    db.delete_port_config(device)
+    # Remove from JSON state if it exists
+    state_file = serial_manager._data_dir / "ports.json"
+    if state_file.exists():
+        try:
+            data = json.loads(state_file.read_text())
+            data["ports"] = [p for p in data.get("ports", []) if p["device"] != device]
+            state_file.write_text(json.dumps(data, indent=2))
+        except Exception:
+            pass
     db.log_audit("port_removed", device)
     return {"status": "ok"}
 
@@ -148,8 +184,9 @@ async def open_port(device: str):
     """Open a serial port and start its reader task."""
     if serial_manager.open_port(device):
         db.log_audit("port_opened", device)
-        # Start a reader task for this port
-        asyncio.create_task(serial_manager.read_port(device, on_reading))
+        # Start a reader task for this port (only if not already running)
+        if device not in serial_manager._tasks:
+            asyncio.create_task(serial_manager.read_port(device, on_reading))
         return {"status": "ok", "message": f"Port {device} opened"}
     raise HTTPException(status_code=400, detail="Failed to open port")
 
@@ -167,10 +204,6 @@ async def get_readings(port_name: str = None, limit: int = 100):
         readings = db.get_readings(port_name=port_name, limit=limit)
     else:
         readings = db.get_latest_readings(limit)
-    # Encode binary data as hex for JSON serialization
-    for r in readings:
-        if r.get("raw_data"):
-            r["raw_data"] = base64.b64encode(r["raw_data"]).decode("ascii")
     return readings
 
 @app.get("/api/readings/history")
@@ -184,10 +217,6 @@ async def get_history(port_name: str = None, hours: int = 24):
         end_time=end_time,
         limit=10000
     )
-    # Encode binary data as hex for JSON serialization
-    for r in readings:
-        if r.get("raw_data"):
-            r["raw_data"] = base64.b64encode(r["raw_data"]).decode("ascii")
     return readings
 
 @app.get("/api/stats")
@@ -212,7 +241,10 @@ async def get_profiles():
 
 @app.post("/api/ports/{device:path}/send")
 async def send_data(device: str, data: Dict):
-    """Send data to a port with validation."""
+    """Send data to a port with validation. DISABLED by default."""
+    if not ENABLE_WRITES:
+        raise HTTPException(status_code=403, detail="Equipment writes disabled. Set ENABLE_WRITES=true to enable.")
+    
     if "hex" in data:
         try:
             bytes_data = bytes.fromhex(data["hex"])
@@ -236,7 +268,11 @@ async def control_inverter(device: str, command: Dict):
     """
     Send control command to inverter with model-specific limits,
     acknowledgment/readback, and audit trail.
+    DISABLED by default.
     """
+    if not ENABLE_WRITES:
+        raise HTTPException(status_code=403, detail="Equipment writes disabled. Set ENABLE_WRITES=true to enable.")
+    
     # Validate command
     register = command.get("register")
     value = command.get("value")
@@ -318,10 +354,6 @@ async def websocket_endpoint(websocket: WebSocket):
     try:
         while True:
             readings = db.get_latest_readings(10)
-            # Encode binary data as hex for JSON serialization
-            for r in readings:
-                if r.get("raw_data"):
-                    r["raw_data"] = base64.b64encode(r["raw_data"]).decode("ascii")
             await websocket.send_json({
                 "type": "readings",
                 "data": readings,

@@ -38,6 +38,9 @@ label{font-size:0.875rem;color:#a0a0a0;display:block;margin-bottom:0.25rem}
 .log-entry.error{color:#d63031}
 .log-entry.valid{color:#00b894}
 .log-entry.stale{color:#fdcb6e}
+.device-card{background:#0f3460;border-radius:8px;padding:1rem;margin-bottom:1rem;border:1px solid #1a1a2e}
+.device-name{color:#e94560;font-weight:bold;margin-bottom:0.5rem}
+.device-timestamp{color:#a0a0a0;font-size:0.75rem;margin-bottom:0.5rem}
 </style></head>
 <body>
 <div class="header"><h1>Solar Monitor</h1><div class="status"><span class="online" id="ws-status">Live</span><span id="port-count">0 ports</span></div></div>
@@ -59,13 +62,133 @@ label{font-size:0.875rem;color:#a0a0a0;display:block;margin-bottom:0.25rem}
 <div class="card"><h3>Reading Log</h3><div class="reading-log" id="reading-log"><p>No readings yet</p></div></div>
 </div>
 <script>
-let ws, readings=[];
-function connectWS(){ws=new WebSocket("ws://"+window.location.host+"/ws");ws.onopen=()=>{document.getElementById("ws-status").textContent="Live";document.getElementById("ws-status").className="online"};ws.onmessage=e=>{const msg=JSON.parse(e.data);if(msg.type==="reading"){readings.unshift(msg.data);if(readings.length>100)readings.pop();updateReadings()}};ws.onclose=()=>{document.getElementById("ws-status").textContent="Offline";document.getElementById("ws-status").className="offline";setTimeout(connectWS,5000)}}
-function updateReadings(){const c=document.getElementById("live-readings");if(readings.length===0)return;const l=readings[0];let h="";for(const[k,v]of Object.entries(l.metrics||{})){const n=parseFloat(v);let cl="neutral";if(n>0)cl="positive";if(n<0)cl="negative";h+="<div class=metric><span class=metric-label>"+k+"</span><span class=\"metric-value "+cl+"\">"+v+"</span></div>"}c.innerHTML=h;const log=document.getElementById("reading-log");log.innerHTML=readings.slice(0,50).map(r=>{const t=new Date(r.timestamp*1000).toLocaleTimeString();const v=r.valid?"valid":"error";const m=Object.entries(r.metrics||{}).map(([k,v])=>k+":"+v).join(", ");return"<div class=log-entry "+v+">["+t+"] "+r.port_name+": "+m+"</div>"}).join("")}
-async function loadPorts(){const r=await fetch("/api/ports");const d=await r.json();document.getElementById("port-count").textContent=d.registered.length+" ports";const l=document.getElementById("port-list");if(d.registered.length===0){l.innerHTML="<li>No ports configured</li>"}else{l.innerHTML=d.registered.map(p=>{const h=p.health||"disconnected";return"<li class=port-item><span>"+(p.name||p.device)+" ("+h+")</span><span class=port-status "+h+">"+h.toUpperCase()+"</span></li>"}).join("")}const s=document.getElementById("port-device");s.innerHTML="<option value=\"\">Select port...</option>"+d.available.map(p=>"<option value="+p.device+">"+p.device+" - "+p.description+"</option>").join("")}
-async function addPort(){const dev=document.getElementById("port-device").value;const n=document.getElementById("port-name").value;const b=parseInt(document.getElementById("port-baud").value);const it=document.getElementById("port-profile").value;if(!dev)return alert("Please select a port");const r=await fetch("/api/ports",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({device:dev,name:n,baudrate:b,inverter_type:it})});if(r.ok){loadPorts();document.getElementById("port-name").value=""}}
-async function addSimulator(){const n="Simulator "+(Date.now()%1000);const it=document.getElementById("port-profile").value;const r=await fetch("/api/ports",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({device:"sim://"+n,name:n,baudrate:9600,inverter_type:it})});if(r.ok){loadPorts()}}
-async function loadProfiles(){const r=await fetch("/api/profiles");const p=await r.json();const s=document.getElementById("port-profile");s.innerHTML=Object.entries(p).map(([k,v])=>"<option value="+k+">"+v.manufacturer+" "+v.name+"</option>").join("")}
-async function loadStats(){const r=await fetch("/api/stats");const s=await r.json();const c=document.getElementById("port-stats");if(s.length===0){c.innerHTML="<p>No statistics available</p>"}else{c.innerHTML=s.map(x=>"<div class=metric><span class=metric-label>"+x.port_name+"</span><span class=metric-value>"+x.total_readings+" readings</span></div>").join("")}}
-connectWS();loadPorts();loadProfiles();loadStats();setInterval(loadPorts,5000);setInterval(loadStats,10000);
+let ws, readings=[], devices={};
+function connectWS(){
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(proto + '//' + window.location.host + '/ws');
+  ws.onopen = () => {
+    document.getElementById('ws-status').textContent = 'Live';
+    document.getElementById('ws-status').className = 'online';
+  };
+  ws.onmessage = e => {
+    const msg = JSON.parse(e.data);
+    if (msg.type === 'reading') {
+      readings.unshift(msg.data);
+      if (readings.length > 100) readings.pop();
+      updateReadings();
+    } else if (msg.type === 'readings') {
+      // Batch update from initial connection
+      readings = msg.data;
+      updateReadings();
+    }
+  };
+  ws.onclose = () => {
+    document.getElementById('ws-status').textContent = 'Offline';
+    document.getElementById('ws-status').className = 'offline';
+    setTimeout(connectWS, 5000);
+  };
+}
+function updateReadings() {
+  const c = document.getElementById('live-readings');
+  if (readings.length === 0) return;
+  
+  // Group readings by device
+  devices = {};
+  readings.forEach(r => {
+    const key = r.port_name || 'unknown';
+    if (!devices[key] || r.timestamp > devices[key].timestamp) {
+      devices[key] = r;
+    }
+  });
+  
+  let h = '';
+  for (const [name, r] of Object.entries(devices)) {
+    const t = new Date(r.timestamp * 1000).toLocaleTimeString();
+    const health = r.health || 'unknown';
+    h += '<div class="device-card">';
+    h += '<div class="device-name">' + escapeHtml(name) + ' (' + escapeHtml(health) + ')</div>';
+    h += '<div class="device-timestamp">' + escapeHtml(t) + '</div>';
+    for (const [k, v] of Object.entries(r.metrics || {})) {
+      const n = parseFloat(v);
+      let cl = 'neutral';
+      if (n > 0) cl = 'positive';
+      if (n < 0) cl = 'negative';
+      h += '<div class="metric"><span class="metric-label">' + escapeHtml(k) + '</span><span class="metric-value ' + cl + '">' + escapeHtml(String(v)) + '</span></div>';
+    }
+    h += '</div>';
+  }
+  c.innerHTML = h;
+  
+  const log = document.getElementById('reading-log');
+  log.innerHTML = readings.slice(0, 50).map(r => {
+    const t = new Date(r.timestamp * 1000).toLocaleTimeString();
+    const v = r.valid ? 'valid' : 'error';
+    const m = Object.entries(r.metrics || {}).map(([k, v]) => escapeHtml(k) + ':' + escapeHtml(String(v))).join(', ');
+    return '<div class="log-entry ' + v + '">[' + escapeHtml(t) + '] ' + escapeHtml(r.port_name) + ': ' + m + '</div>';
+  }).join('');
+}
+function escapeHtml(s) {
+  const div = document.createElement('div');
+  div.textContent = s;
+  return div.innerHTML;
+}
+async function loadPorts() {
+  const r = await fetch('/api/ports');
+  const d = await r.json();
+  document.getElementById('port-count').textContent = d.registered.length + ' ports';
+  const l = document.getElementById('port-list');
+  if (d.registered.length === 0) {
+    l.innerHTML = '<li>No ports configured</li>';
+  } else {
+    l.innerHTML = d.registered.map(p => {
+      const h = p.health || 'disconnected';
+      return '<li class="port-item"><span>' + escapeHtml(p.name || p.device) + ' (' + escapeHtml(h) + ')</span><span class="port-status ' + escapeHtml(h) + '">' + h.toUpperCase() + '</span></li>';
+    }).join('');
+  }
+  const s = document.getElementById('port-device');
+  s.innerHTML = '<option value="">Select port...</option>' + d.available.map(p => '<option value="' + escapeHtml(p.device) + '">' + escapeHtml(p.device) + ' - ' + escapeHtml(p.description) + '</option>').join('');
+}
+async function addPort() {
+  const dev = document.getElementById('port-device').value;
+  const n = document.getElementById('port-name').value;
+  const b = parseInt(document.getElementById('port-baud').value);
+  const it = document.getElementById('port-profile').value;
+  if (!dev) return alert('Please select a port');
+  const r = await fetch('/api/ports', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({device: dev, name: n, baudrate: b, inverter_type: it})
+  });
+  if (r.ok) {
+    loadPorts();
+    document.getElementById('port-name').value = '';
+  }
+}
+async function addSimulator() {
+  const n = 'Simulator ' + (Date.now() % 1000);
+  const it = document.getElementById('port-profile').value;
+  const r = await fetch('/api/ports', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({device: 'sim://' + n, name: n, baudrate: 9600, inverter_type: it})
+  });
+  if (r.ok) loadPorts();
+}
+async function loadProfiles() {
+  const r = await fetch('/api/profiles');
+  const p = await r.json();
+  const s = document.getElementById('port-profile');
+  s.innerHTML = Object.entries(p).map(([k, v]) => '<option value="' + escapeHtml(k) + '">' + escapeHtml(v.manufacturer) + ' ' + escapeHtml(v.name) + '</option>').join('');
+}
+async function loadStats() {
+  const r = await fetch('/api/stats');
+  const s = await r.json();
+  const c = document.getElementById('port-stats');
+  if (s.length === 0) {
+    c.innerHTML = '<p>No statistics available</p>';
+  } else {
+    c.innerHTML = s.map(x => '<div class="metric"><span class="metric-label">' + escapeHtml(x.port_name) + '</span><span class="metric-value">' + x.total_readings + ' readings</span></div>').join('');
+  }
+}
+connectWS(); loadPorts(); loadProfiles(); loadStats(); setInterval(loadPorts, 5000); setInterval(loadStats, 10000);
 </script></body></html>

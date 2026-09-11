@@ -3,6 +3,9 @@
 Database Layer
 Stores all readings, configurations, and historical data
 Uses SQLite for local storage (no cloud dependency)
+
+Single source of truth for all configuration.
+Binary data stored as BLOB, encoded as hex only at API boundary.
 """
 import sqlite3
 import json
@@ -166,6 +169,15 @@ class SolarDatabase:
                 pass  # Already hex string
         else:
             row["raw_data"] = ""
+        
+        # Decode metrics JSON string to dict
+        metrics = row.get("metrics")
+        if isinstance(metrics, str):
+            try:
+                row["metrics"] = json.loads(metrics)
+            except (json.JSONDecodeError, TypeError):
+                row["metrics"] = {}
+        
         return row
     
     def get_port_stats(self) -> List[Dict]:
@@ -210,6 +222,12 @@ class SolarDatabase:
             conn.row_factory = sqlite3.Row
             rows = conn.execute("SELECT * FROM ports").fetchall()
             return [dict(row) for row in rows]
+    
+    def delete_port_config(self, device: str):
+        """Delete port configuration from database."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("DELETE FROM ports WHERE device = ?", (device,))
+            conn.commit()
     
     def get_setting(self, key: str, default: str = "") -> str:
         """Get a setting value."""

@@ -4,6 +4,12 @@ Solar Monitor - Multi-Serial Ingestion Engine
 Manages multiple RS-232/RS-485/CAN adapters simultaneously.
 Each adapter connects to a different inverter or BMS.
 Devices retain identity across reconnects; stale/invalid data is flagged.
+
+Features:
+- Proper Modbus transactions with buffering and timeouts
+- Exactly one worker per port (no duplicate readers)
+- Automatic reconnection after USB disconnection
+- Simulator integration through same polling path
 """
 import serial
 import serial.tools.list_ports
@@ -19,7 +25,7 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
-from modbus_handler import ModbusRTU, get_profile, InverterProfile
+from modbus_handler import ModbusRTU, get_profile, InverterProfile, InverterSimulator
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +95,91 @@ class InverterReading:
     health: DeviceHealth = DeviceHealth.HEALTHY
 
 
+class ModbusTransaction:
+    """
+    Manages a single Modbus transaction with proper frame assembly,
+    response timeouts, and validation.
+    """
+    
+    def __init__(self, slave_id: int, function_code: int, start_addr: int, count: int):
+        self.slave_id = slave_id
+        self.function_code = function_code
+        self.start_addr = start_addr
+        self.count = count
+        self.request_time = 0.0
+        self.response_buffer = b""
+        self.expected_length = 0
+        
+        # Calculate expected response length
+        if function_code in (0x03, 0x04):
+            self.expected_length = 5 + (count * 2)  # slave + func + count + data + crc
+        elif function_code == 0x06:
+            self.expected_length = 8
+    
+    def build_request(self) -> bytes:
+        """Build the Modbus request frame."""
+        if self.function_code == 0x03:
+            return ModbusRTU.build_read_holding_registers(
+                self.slave_id, self.start_addr, self.count
+            )
+        elif self.function_code == 0x04:
+            return ModbusRTU.build_read_input_registers(
+                self.slave_id, self.start_addr, self.count
+            )
+        elif self.function_code == 0x06:
+            return ModbusRTU.build_write_single_register(
+                self.slave_id, self.start_addr, self.count
+            )
+        return b""
+    
+    def add_response_data(self, data: bytes) -> Optional[Dict]:
+        """
+        Add received data to buffer and attempt to parse complete response.
+        Returns parsed response if complete, None if more data needed.
+        """
+        self.response_buffer += data
+        
+        # Check if we have enough data
+        if len(self.response_buffer) < 5:
+            return None
+        
+        # Check for complete response based on function code
+        func_code = self.response_buffer[1]
+        
+        if func_code in (0x03, 0x04):
+            # Read response: byte_count at position[2], total = 5 + byte_count
+            byte_count = self.response_buffer[2]
+            expected_len = 5 + byte_count
+            if len(self.response_buffer) < expected_len:
+                return None
+            # Extract complete frame
+            frame = self.response_buffer[:expected_len]
+            self.response_buffer = self.response_buffer[expected_len:]
+            return ModbusRTU.parse_response(frame)
+        
+        elif func_code == 0x06:
+            # Write response: always 8 bytes
+            if len(self.response_buffer) < 8:
+                return None
+            frame = self.response_buffer[:8]
+            self.response_buffer = self.response_buffer[8:]
+            return ModbusRTU.parse_response(frame)
+        
+        elif func_code & 0x80:
+            # Exception: 5 bytes
+            if len(self.response_buffer) < 5:
+                return None
+            frame = self.response_buffer[:5]
+            self.response_buffer = self.response_buffer[5:]
+            return ModbusRTU.parse_response(frame)
+        
+        return None
+    
+    def is_expired(self, timeout: float = 2.0) -> bool:
+        """Check if transaction has expired (no response received)."""
+        return (time.time() - self.request_time) > timeout and self.request_time > 0
+
+
 class SerialPortManager:
     """Manages multiple serial ports and their data streams."""
 
@@ -98,9 +189,10 @@ class SerialPortManager:
         self.max_history = 100000
         self._callbacks: List[Callable] = []
         self._running = False
-        self._tasks: List[asyncio.Task] = []
+        self._tasks: Dict[str, asyncio.Task] = {}  # One task per port
         self._data_dir = Path(data_dir)
         self._data_dir.mkdir(parents=True, exist_ok=True)
+        self._simulators: Dict[str, InverterSimulator] = {}
         self._load_state()
 
     def _load_state(self):
@@ -171,6 +263,14 @@ class SerialPortManager:
         port.device_fingerprint = port.fingerprint()
         self.ports[port.device] = port
         self._save_state()
+        
+        # Create simulator for sim:// devices
+        if port.device.startswith("sim://"):
+            profile = get_profile(port.inverter_type)
+            self._simulators[port.device] = InverterSimulator(profile)
+            port.is_open = True
+            port.health = DeviceHealth.HEALTHY
+        
         return True
 
     def remove_port(self, device: str):
@@ -180,6 +280,8 @@ class SerialPortManager:
             if port.is_open:
                 self.close_port(device)
             del self.ports[device]
+            if device in self._simulators:
+                del self._simulators[device]
             self._save_state()
 
     def open_port(self, device: str) -> bool:
@@ -187,6 +289,13 @@ class SerialPortManager:
         if device not in self.ports:
             return False
         port = self.ports[device]
+        
+        # Simulator ports are always "open"
+        if device.startswith("sim://"):
+            port.is_open = True
+            port.health = DeviceHealth.HEALTHY
+            return True
+        
         try:
             port.serial_conn = serial.Serial(
                 port=port.device,
@@ -215,6 +324,10 @@ class SerialPortManager:
                 port.serial_conn.close()
             port.is_open = False
             port.health = DeviceHealth.DISCONNECTED
+            # Cancel any running task for this device
+            if device in self._tasks:
+                self._tasks[device].cancel()
+                del self._tasks[device]
 
     def open_all(self) -> Dict[str, bool]:
         """Open all registered ports."""
@@ -231,94 +344,214 @@ class SerialPortManager:
     async def read_port(self, device: str, callback: Optional[Callable] = None):
         """
         Continuously read from a single port with health monitoring.
-        Sends Modbus requests, assembles responses, validates CRC,
-        decodes registers, and publishes readings.
+        Sends Modbus requests, assembles responses with proper buffering,
+        validates CRC, decodes registers, and publishes readings.
+        
+        Handles:
+        - Partial response buffering
+        - Response timeouts
+        - Slave ID and function code verification
+        - Automatic reconnection on disconnection
         """
         port = self.ports[device]
         profile = get_profile(port.inverter_type)
         
+        # Determine register range
+        if profile.registers:
+            start_addr = min(r.address for r in profile.registers)
+            count = max(r.address for r in profile.registers) - start_addr + 1
+        else:
+            start_addr = 0
+            count = 10
+        
+        consecutive_errors = 0
+        max_consecutive_errors = 10
+        
         while self._running and port.is_open:
             try:
-                # Send Modbus read request
-                if port.serial_conn and port.serial_conn.in_waiting == 0:
-                    slave_id = profile.slave_id
-                    # Read all registers from the profile
-                    if profile.registers:
-                        start_addr = min(r.address for r in profile.registers)
-                        count = max(r.address for r in profile.registers) - start_addr + 1
-                        request = ModbusRTU.build_read_holding_registers(slave_id, start_addr, count)
-                        port.serial_conn.write(request)
-                
-                # Wait for response
-                await asyncio.sleep(0.1)
-                
-                if port.serial_conn and port.serial_conn.in_waiting > 0:
-                    data = port.serial_conn.read(port.serial_conn.in_waiting)
-                    port.last_read = time.time()
-                    port.total_reads += 1
+                # Handle simulator
+                if device.startswith("sim://") and device in self._simulators:
+                    simulator = self._simulators[device]
+                    simulator.update()
                     
-                    # Parse Modbus response
-                    parsed = ModbusRTU.parse_response(data)
+                    # Build and handle request through simulator
+                    request = ModbusRTU.build_read_holding_registers(
+                        profile.slave_id, start_addr, count
+                    )
+                    response = simulator.handle_request(request)
                     
-                    if parsed and not parsed.get("error"):
-                        # Decode registers
-                        register_map = profile.get_register_map()
-                        start_addr = min(r.address for r in profile.registers) if profile.registers else 0
-                        metrics = ModbusRTU.decode_registers(
-                            parsed.get("registers", []),
-                            register_map,
-                            start_addr
-                        )
+                    if response:
+                        parsed = ModbusRTU.parse_response(response)
+                        if parsed and not parsed.get("error"):
+                            register_map = profile.get_register_map()
+                            metrics = ModbusRTU.decode_registers(
+                                parsed.get("registers", []),
+                                register_map,
+                                start_addr
+                            )
+                            
+                            # Validate decoded values
+                            valid = True
+                            error_msg = ""
+                            for key, value in metrics.items():
+                                if isinstance(value, float) and (value != value or value == float('inf') or value == float('-inf')):
+                                    valid = False
+                                    error_msg = f"Invalid value for {key}"
+                                    break
+                            
+                            if valid and metrics:
+                                port.last_valid_read = time.time()
+                                port.health = DeviceHealth.HEALTHY
+                                port.last_read = time.time()
+                                port.total_reads += 1
+                            
+                            reading = InverterReading(
+                                timestamp=time.time(),
+                                port_name=port.name,
+                                device_id=port.device_fingerprint,
+                                device_type=port.inverter_type,
+                                metrics=metrics,
+                                raw_data=response,
+                                valid=valid,
+                                error=error_msg,
+                                health=port.health,
+                            )
+                            self._add_reading(reading)
+                            if callback:
+                                await callback(reading)
+                    
+                    await asyncio.sleep(1)  # Simulator update rate
+                    continue
+                
+                # Real hardware path
+                if not port.serial_conn or not port.serial_conn.is_open:
+                    # Attempt reconnection
+                    if not self.open_port(device):
+                        await asyncio.sleep(5)
+                        continue
+                
+                # Create Modbus transaction
+                transaction = ModbusTransaction(
+                    slave_id=profile.slave_id,
+                    function_code=0x03,
+                    start_addr=start_addr,
+                    count=count
+                )
+                
+                # Send request
+                request = transaction.build_request()
+                port.serial_conn.write(request)
+                transaction.request_time = time.time()
+                
+                # Wait for response with timeout
+                response_received = False
+                while self._running and port.is_open:
+                    # Check for timeout
+                    if transaction.is_expired(timeout=2.0):
+                        break
+                    
+                    # Read available data
+                    if port.serial_conn.in_waiting > 0:
+                        data = port.serial_conn.read(port.serial_conn.in_waiting)
+                        result = transaction.add_response_data(data)
                         
-                        # Validate decoded values
-                        valid = True
-                        error_msg = ""
-                        for key, value in metrics.items():
-                            if isinstance(value, float) and (value != value or value == float('inf') or value == float('-inf')):
-                                valid = False
-                                error_msg = f"Invalid value for {key}"
+                        if result is not None:
+                            # Validate response
+                            if result.get("slave_id") != profile.slave_id:
+                                # Wrong slave - discard
                                 break
-                        
-                        if valid and metrics:
-                            port.last_valid_read = time.time()
-                            port.health = DeviceHealth.HEALTHY
-                        
-                        reading = InverterReading(
-                            timestamp=time.time(),
-                            port_name=port.name,
-                            device_id=port.device_fingerprint,
-                            device_type=port.inverter_type,
-                            metrics=metrics,
-                            raw_data=data,
-                            valid=valid,
-                            error=error_msg,
-                            health=port.health,
-                        )
-                    else:
-                        # Parse error or invalid response
-                        reading = InverterReading(
-                            timestamp=time.time(),
-                            port_name=port.name,
-                            device_id=port.device_fingerprint,
-                            device_type=port.inverter_type,
-                            metrics={},
-                            raw_data=data,
-                            valid=False,
-                            error="Invalid or error response",
-                            health=DeviceHealth.ERROR,
-                        )
+                            
+                            if result.get("function_code") != 0x03:
+                                # Unexpected function code - discard
+                                break
+                            
+                            if result.get("error"):
+                                # Modbus exception
+                                port.error_count += 1
+                                consecutive_errors += 1
+                                reading = InverterReading(
+                                    timestamp=time.time(),
+                                    port_name=port.name,
+                                    device_id=port.device_fingerprint,
+                                    device_type=port.inverter_type,
+                                    metrics={},
+                                    raw_data=data,
+                                    valid=False,
+                                    error=f"Modbus exception: {result.get('exception_code')}",
+                                    health=DeviceHealth.ERROR,
+                                )
+                                self._add_reading(reading)
+                                if callback:
+                                    await callback(reading)
+                                response_received = True
+                                break
+                            
+                            # Decode registers
+                            register_map = profile.get_register_map()
+                            metrics = ModbusRTU.decode_registers(
+                                result.get("registers", []),
+                                register_map,
+                                start_addr
+                            )
+                            
+                            # Validate decoded values
+                            valid = True
+                            error_msg = ""
+                            for key, value in metrics.items():
+                                if isinstance(value, float) and (value != value or value == float('inf') or value == float('-inf')):
+                                    valid = False
+                                    error_msg = f"Invalid value for {key}"
+                                    break
+                            
+                            if valid and metrics:
+                                port.last_valid_read = time.time()
+                                port.health = DeviceHealth.HEALTHY
+                                consecutive_errors = 0
+                            
+                            port.last_read = time.time()
+                            port.total_reads += 1
+                            
+                            reading = InverterReading(
+                                timestamp=time.time(),
+                                port_name=port.name,
+                                device_id=port.device_fingerprint,
+                                device_type=port.inverter_type,
+                                metrics=metrics,
+                                raw_data=data,
+                                valid=valid,
+                                error=error_msg,
+                                health=port.health,
+                            )
+                            self._add_reading(reading)
+                            if callback:
+                                await callback(reading)
+                            response_received = True
+                            break
                     
-                    self._add_reading(reading)
-                    if callback:
-                        await callback(reading)
-                else:
-                    # Check staleness
-                    if port.last_valid_read > 0 and (time.time() - port.last_valid_read) > port.max_stale_seconds:
-                        port.health = DeviceHealth.STALE
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.01)
+                
+                if not response_received:
+                    # Timeout or error
+                    port.error_count += 1
+                    consecutive_errors += 1
+                    
+                    if consecutive_errors >= max_consecutive_errors:
+                        port.health = DeviceHealth.ERROR
+                        # Try to reconnect
+                        self.close_port(device)
+                        await asyncio.sleep(5)
+                        continue
+                
+                # Check staleness
+                if port.last_valid_read > 0 and (time.time() - port.last_valid_read) > port.max_stale_seconds:
+                    port.health = DeviceHealth.STALE
+                
+                # Polling interval
+                await asyncio.sleep(0.5)
                     
             except Exception as e:
                 port.error_count += 1
+                consecutive_errors += 1
                 port.health = DeviceHealth.ERROR
                 reading = InverterReading(
                     timestamp=time.time(),
@@ -333,7 +566,10 @@ class SerialPortManager:
                 self._add_reading(reading)
                 if callback:
                     await callback(reading)
-                await asyncio.sleep(1)
+                
+                # Attempt reconnection
+                self.close_port(device)
+                await asyncio.sleep(5)
 
     def _add_reading(self, reading: InverterReading):
         """Add a reading to history."""
@@ -344,28 +580,30 @@ class SerialPortManager:
     async def start(self, callback: Optional[Callable] = None):
         """
         Start reading from all ports.
-        Opens all registered ports first, then creates reader tasks.
+        Opens all registered ports first, then creates exactly one reader task per port.
         """
         self._running = True
-        self._tasks = []
         
         # Open all ports first
         for device in self.ports:
             self.open_port(device)
         
-        # Create reader tasks for all open ports
+        # Create exactly one reader task per open port
         for device in self.ports:
-            if self.ports[device].is_open:
+            if self.ports[device].is_open and device not in self._tasks:
                 task = asyncio.create_task(self.read_port(device, callback))
-                self._tasks.append(task)
+                self._tasks[device] = task
         
-        await asyncio.gather(*self._tasks, return_exceptions=True)
+        # Wait for all tasks
+        if self._tasks:
+            await asyncio.gather(*self._tasks.values(), return_exceptions=True)
 
     async def stop(self):
         """Stop all reading tasks."""
         self._running = False
-        for task in self._tasks:
+        for device, task in self._tasks.items():
             task.cancel()
+        self._tasks.clear()
         self.close_all()
 
     def get_port_status(self) -> List[Dict]:

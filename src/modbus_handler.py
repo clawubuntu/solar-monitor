@@ -88,7 +88,6 @@ class ModbusRTU:
     @staticmethod
     def build_write_single_register(slave_id: int, addr: int, value: int) -> bytes:
         """Build Modbus RTU write single register request."""
-        # FIX: was ">BHHH" (expects 4 values), now ">BHH" (3 values: func_code, addr, value)
         pdu = struct.pack(">BHH", 0x06, addr, value)
         frame = struct.pack("B", slave_id) + pdu
         crc = ModbusRTU.calculate_crc(frame)
@@ -190,6 +189,22 @@ class ModbusRTU:
                 result[reg.name] = round(decoded, 3)
             i += 1
         return result
+    
+    @staticmethod
+    def expected_response_length(slave_id: int, function_code: int, 
+                                  expected_bytes: int = 0) -> int:
+        """Calculate expected response length for validation."""
+        if function_code in (0x03, 0x04):
+            # slave(1) + func(1) + byte_count(1) + data(N) + crc(2)
+            return 5 + expected_bytes
+        elif function_code == 0x06:
+            # Write response: slave(1) + func(1) + addr(2) + value(2) + crc(2)
+            return 8
+        elif function_code & 0x80:
+            # Exception: slave(1) + func(1) + exception_code(1) + crc(2)
+            return 5
+        return 0
+
 
 class InverterSimulator:
     """Simulates inverter responses for testing without hardware."""
@@ -315,6 +330,7 @@ class InverterSimulator:
         
         return b""
 
+
 # Common inverter profiles
 INVERTER_PROFILES = {
     "deye_sg03lp1": InverterProfile(
@@ -354,6 +370,42 @@ INVERTER_PROFILES = {
             ModbusRegister(3, "grid_voltage", "V", scale=0.1, category="grid"),
             ModbusRegister(4, "grid_power", "W", scale=1, category="grid"),
             ModbusRegister(5, "load_power", "W", scale=1, category="load"),
+        ]
+    ),
+    "jk_bms": InverterProfile(
+        name="JK-BMS",
+        manufacturer="JK",
+        protocol="modbus_rtu",
+        baudrate=115200,
+        slave_id=1,
+        registers=[
+            ModbusRegister(0x0001, "cell_01_v", "V", scale=0.001, category="battery", description="Cell 1 voltage"),
+            ModbusRegister(0x0002, "cell_02_v", "V", scale=0.001, category="battery", description="Cell 2 voltage"),
+            ModbusRegister(0x0003, "cell_03_v", "V", scale=0.001, category="battery", description="Cell 3 voltage"),
+            ModbusRegister(0x0004, "cell_04_v", "V", scale=0.001, category="battery", description="Cell 4 voltage"),
+            ModbusRegister(0x0005, "cell_05_v", "V", scale=0.001, category="battery", description="Cell 5 voltage"),
+            ModbusRegister(0x0006, "cell_06_v", "V", scale=0.001, category="battery", description="Cell 6 voltage"),
+            ModbusRegister(0x0007, "cell_07_v", "V", scale=0.001, category="battery", description="Cell 7 voltage"),
+            ModbusRegister(0x0008, "cell_08_v", "V", scale=0.001, category="battery", description="Cell 8 voltage"),
+            ModbusRegister(0x0009, "cell_09_v", "V", scale=0.001, category="battery", description="Cell 9 voltage"),
+            ModbusRegister(0x000A, "cell_10_v", "V", scale=0.001, category="battery", description="Cell 10 voltage"),
+            ModbusRegister(0x000B, "cell_11_v", "V", scale=0.001, category="battery", description="Cell 11 voltage"),
+            ModbusRegister(0x000C, "cell_12_v", "V", scale=0.001, category="battery", description="Cell 12 voltage"),
+            ModbusRegister(0x000D, "cell_13_v", "V", scale=0.001, category="battery", description="Cell 13 voltage"),
+            ModbusRegister(0x000E, "cell_14_v", "V", scale=0.001, category="battery", description="Cell 14 voltage"),
+            ModbusRegister(0x000F, "cell_15_v", "V", scale=0.001, category="battery", description="Cell 15 voltage"),
+            ModbusRegister(0x0010, "cell_16_v", "V", scale=0.001, category="battery", description="Cell 16 voltage"),
+            ModbusRegister(0x0011, "battery_voltage", "V", scale=0.01, category="battery", description="Total battery voltage"),
+            ModbusRegister(0x0012, "battery_current", "A", scale=0.01, category="battery", description="Battery current"),
+            ModbusRegister(0x0013, "battery_soc", "%", scale=1, category="battery", min_value=0, max_value=100, description="State of charge"),
+            ModbusRegister(0x0014, "battery_soh", "%", scale=1, category="battery", min_value=0, max_value=100, description="State of health"),
+            ModbusRegister(0x0015, "battery_temp1", "°C", scale=0.1, category="battery", description="Battery temperature 1"),
+            ModbusRegister(0x0016, "battery_temp2", "°C", scale=0.1, category="battery", description="Battery temperature 2"),
+            ModbusRegister(0x0017, "mos_temp", "°C", scale=0.1, category="battery", description="MOS temperature"),
+            ModbusRegister(0x0018, "balance_current", "A", scale=0.01, category="battery", description="Balance current"),
+            ModbusRegister(0x0019, "cycle_count", "", scale=1, category="battery", description="Cycle count"),
+            ModbusRegister(0x001A, "full_capacity", "Ah", scale=0.01, category="battery", description="Full capacity"),
+            ModbusRegister(0x001B, "remaining_capacity", "Ah", scale=0.01, category="battery", description="Remaining capacity"),
         ]
     ),
     "generic": InverterProfile(
