@@ -26,6 +26,18 @@ from enum import Enum
 from pathlib import Path
 
 from modbus_handler import ModbusRTU, get_profile, InverterProfile, InverterSimulator
+from jk_bms_handler import (
+    build_query as jk_build_query,
+    parse_frame as jk_parse_frame,
+    parse_runtime_data as jk_parse_runtime_data,
+    parse_config_data as jk_parse_config_data,
+    parse_device_info as jk_parse_device_info,
+    parse_fault_info as jk_parse_fault_info,
+    FRAME_RUNTIME_DATA,
+    FRAME_CONFIG_READ,
+    FRAME_DEVICE_INFO,
+    FRAME_FAULT_INFO,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -344,16 +356,25 @@ class SerialPortManager:
     async def read_port(self, device: str, callback: Optional[Callable] = None):
         """
         Continuously read from a single port with health monitoring.
-        Sends Modbus requests, assembles responses with proper buffering,
-        validates CRC, decodes registers, and publishes readings.
+        Sends protocol requests, assembles responses with proper buffering,
+        validates checksum, decodes registers, and publishes readings.
         
         Handles:
         - Partial response buffering
         - Response timeouts
         - Slave ID and function code verification
         - Automatic reconnection on disconnection
+        - JK-BMS custom protocol support
         """
         port = self.ports[device]
+        
+        # Check if this is a JK-BMS device
+        is_jk_bms = port.inverter_type == "jk_bms"
+        
+        if is_jk_bms:
+            await self._read_jk_bms(device, callback)
+            return
+        
         profile = get_profile(port.inverter_type)
         
         # Determine register range
@@ -571,7 +592,190 @@ class SerialPortManager:
                 self.close_port(device)
                 await asyncio.sleep(5)
 
-    def _add_reading(self, reading: InverterReading):
+    async def _read_jk_bms(self, device: str, callback: Optional[Callable] = None):
+        """
+        Read from a JK-BMS device using the custom 300-byte frame protocol.
+        
+        Frame format:
+          [0:4]   Header: 55 AA EB 90
+          [4]     Frame code (0x01-0x06)
+          [5]     Counter
+          [6:299] Data (293 bytes)
+          [299]   Checksum (sum8)
+        """
+        port = self.ports[device]
+        counter = 0
+        consecutive_errors = 0
+        max_consecutive_errors = 10
+        
+        # Polling sequence: runtime data, config, device info, fault info
+        poll_sequence = [
+            FRAME_RUNTIME_DATA,
+            FRAME_CONFIG_READ,
+            FRAME_DEVICE_INFO,
+            FRAME_FAULT_INFO,
+        ]
+        poll_index = 0
+        
+        while self._running and port.is_open:
+            try:
+                if not port.serial_conn or not port.serial_conn.is_open:
+                    if not self.open_port(device):
+                        await asyncio.sleep(5)
+                        continue
+                
+                # Get next frame code to poll
+                frame_code = poll_sequence[poll_index % len(poll_sequence)]
+                poll_index += 1
+                
+                # Build and send query
+                query = jk_build_query(frame_code, counter)
+                port.serial_conn.write(query)
+                
+                # Wait for response (350ms timeout per spec)
+                response_data = b""
+                timeout = time.time() + 0.35
+                while self._running and port.is_open and time.time() < timeout:
+                    if port.serial_conn.in_waiting > 0:
+                        response_data += port.serial_conn.read(port.serial_conn.in_waiting)
+                        # Check if we have a complete 300-byte frame
+                        if len(response_data) >= 300:
+                            break
+                    await asyncio.sleep(0.005)  # 5ms polling interval per spec
+                
+                if len(response_data) < 300:
+                    # Incomplete response
+                    port.error_count += 1
+                    consecutive_errors += 1
+                    if consecutive_errors >= max_consecutive_errors:
+                        port.health = DeviceHealth.ERROR
+                    await asyncio.sleep(0.1)
+                    continue
+                
+                # Parse frame
+                parsed = jk_parse_frame(response_data[:300])
+                if not parsed:
+                    port.error_count += 1
+                    consecutive_errors += 1
+                    if consecutive_errors >= max_consecutive_errors:
+                        port.health = DeviceHealth.ERROR
+                    await asyncio.sleep(0.1)
+                    continue
+                
+                # Extract metrics based on frame code
+                metrics = {}
+                data = parsed["data"]
+                
+                if parsed["frame_code"] == FRAME_RUNTIME_DATA:
+                    runtime = jk_parse_runtime_data(data)
+                    metrics = {
+                        "voltage": runtime.get("voltage", 0),
+                        "current": runtime.get("current", 0),
+                        "power": runtime.get("power", 0),
+                        "soc": runtime.get("soc", 0),
+                        "temp1": runtime.get("temp1", 0),
+                        "temp2": runtime.get("temp2", 0),
+                        "mos_temp": runtime.get("mos_temp", 0),
+                        "avg_cell_v": runtime.get("avg_cell_v", 0),
+                        "volt_delta": runtime.get("volt_delta", 0),
+                        "remaining_capacity": runtime.get("remaining_capacity", 0),
+                        "full_capacity": runtime.get("full_capacity", 0),
+                        "cycle_count": runtime.get("cycle_count", 0),
+                    }
+                    # Add individual cell voltages
+                    for i, v in enumerate(runtime.get("cell_voltages", [])):
+                        metrics[f"cell_{i+1:02d}_v"] = v
+                
+                elif parsed["frame_code"] == FRAME_CONFIG_READ:
+                    config = jk_parse_config_data(data)
+                    metrics = {
+                        "cell_uv": config.get("cell_uv", 0),
+                        "cell_ov": config.get("cell_ov", 0),
+                        "balance_trig": config.get("balance_trig", 0),
+                        "charge_otp": config.get("charge_otp", 0),
+                        "discharge_otp": config.get("discharge_otp", 0),
+                        "cell_count": config.get("cell_count", 0),
+                        "charge_enabled": config.get("charge_enabled", 0),
+                    }
+                
+                elif parsed["frame_code"] == FRAME_DEVICE_INFO:
+                    info = jk_parse_device_info(data)
+                    metrics = {
+                        "device_name": info.get("device_name", ""),
+                        "manufacturer": info.get("manufacturer", ""),
+                        "chemistry": info.get("chemistry", ""),
+                        "nominal_voltage": info.get("nominal_voltage", 0),
+                        "nominal_capacity": info.get("nominal_capacity", 0),
+                    }
+                
+                elif parsed["frame_code"] == FRAME_FAULT_INFO:
+                    faults = jk_parse_fault_info(data)
+                    metrics = {
+                        "fault_code": faults.get("fault_code", 0),
+                        "cell_ov_fault": faults.get("cell_ov", 0),
+                        "cell_uv_fault": faults.get("cell_uv", 0),
+                        "charge_oc_fault": faults.get("charge_oc", 0),
+                        "discharge_oc_fault": faults.get("discharge_oc", 0),
+                    }
+                
+                # Validate metrics
+                valid = True
+                error_msg = ""
+                for key, value in metrics.items():
+                    if isinstance(value, float) and (value != value or value == float('inf') or value == float('-inf')):
+                        valid = False
+                        error_msg = f"Invalid value for {key}"
+                        break
+                
+                if valid and metrics:
+                    port.last_valid_read = time.time()
+                    port.health = DeviceHealth.HEALTHY
+                    consecutive_errors = 0
+                
+                port.last_read = time.time()
+                port.total_reads += 1
+                
+                reading = InverterReading(
+                    timestamp=time.time(),
+                    port_name=port.name,
+                    device_id=port.device_fingerprint,
+                    device_type=port.inverter_type,
+                    metrics=metrics,
+                    raw_data=response_data[:300],
+                    valid=valid,
+                    error=error_msg,
+                    health=port.health,
+                )
+                self._add_reading(reading)
+                if callback:
+                    await callback(reading)
+                
+                # Increment counter
+                counter = (counter + 1) % 256
+                
+                # Polling interval (20ms between queries per spec)
+                await asyncio.sleep(0.02)
+                    
+            except Exception as e:
+                port.error_count += 1
+                consecutive_errors += 1
+                port.health = DeviceHealth.ERROR
+                reading = InverterReading(
+                    timestamp=time.time(),
+                    port_name=port.name,
+                    device_id=port.device_fingerprint,
+                    device_type=port.inverter_type,
+                    metrics={},
+                    valid=False,
+                    error=str(e),
+                    health=DeviceHealth.ERROR,
+                )
+                self._add_reading(reading)
+                if callback:
+                    await callback(reading)
+                
+                self.close_port(device)
+                await asyncio.sleep(5)
         """Add a reading to history."""
         self.readings.append(reading)
         if len(self.readings) > self.max_history:
