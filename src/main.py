@@ -182,6 +182,9 @@ async def remove_port(device: str):
 @app.post("/api/ports/{device:path}/open")
 async def open_port(device: str):
     """Open a serial port and start its reader task."""
+    # Handle URL path stripping leading slash
+    if not device.startswith("/"):
+        device = "/" + device
     if serial_manager.open_port(device):
         db.log_audit("port_opened", device)
         # Start a reader task for this port (only if not already running)
@@ -193,6 +196,8 @@ async def open_port(device: str):
 @app.post("/api/ports/{device:path}/close")
 async def close_port(device: str):
     """Close a serial port."""
+    if not device.startswith("/"):
+        device = "/" + device
     serial_manager.close_port(device)
     db.log_audit("port_closed", device)
     return {"status": "ok"}
