@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
-from modbus_handler import ModbusRTU, get_profile, InverterProfile, InverterSimulator
+from modbus_handler import ModbusRTU, get_profile, InverterProfile, InverterSimulator, InverterSimulatorJKPB
 from jk_bms_handler import (
     build_query as jk_build_query,
     parse_frame as jk_parse_frame,
@@ -37,6 +37,17 @@ from jk_bms_handler import (
     FRAME_CONFIG_READ,
     FRAME_DEVICE_INFO,
     FRAME_FAULT_INFO,
+)
+from jk_pb_5aa5_handler import (
+    decode_frames,
+    parse_runtime_data as jk_pb_parse_runtime_data,
+    parse_cell_voltages as jk_pb_parse_cell_voltages,
+    parse_status_frame as jk_pb_parse_status_frame,
+    build_trigger_query as jk_pb_build_trigger_query,
+    process_frames as jk_pb_process_frames,
+    FRAME_RUNTIME_DATA as JK_PB_FRAME_RUNTIME_DATA,
+    FRAME_CELL_VOLTAGES as JK_PB_FRAME_CELL_VOLTAGES,
+    FRAME_STATUS as JK_PB_FRAME_STATUS,
 )
 
 logger = logging.getLogger(__name__)
@@ -279,7 +290,10 @@ class SerialPortManager:
         # Create simulator for sim:// devices
         if port.device.startswith("sim://"):
             profile = get_profile(port.inverter_type)
-            self._simulators[port.device] = InverterSimulator(profile)
+            if port.inverter_type == "jk_pb_5aa5":
+                self._simulators[port.device] = InverterSimulatorJKPB(profile)
+            else:
+                self._simulators[port.device] = InverterSimulator(profile)
             port.is_open = True
             port.health = DeviceHealth.HEALTHY
         
@@ -373,6 +387,13 @@ class SerialPortManager:
         
         if is_jk_bms:
             await self._read_jk_bms(device, callback)
+            return
+        
+        # Check if this is a JK-PB 5AA5 protocol device
+        is_jk_pb_5aa5 = port.inverter_type == "jk_pb_5aa5"
+        
+        if is_jk_pb_5aa5:
+            await self._read_jk_pb_5aa5(device, callback)
             return
         
         profile = get_profile(port.inverter_type)
@@ -595,6 +616,130 @@ class SerialPortManager:
                 self.close_port(device)
                 await asyncio.sleep(5)
 
+
+    async def _read_jk_pb_5aa5(self, device: str, callback: Optional[Callable] = None):
+        """
+        Read from a JK-PB device using the 5AA5 frame protocol at 115200 baud.
+        
+        Frame format:
+          [0:2]   Delimiter: 5A A5
+          [2:4]   Frame type (big-endian u16)
+          [4]     Length (number of data bytes)
+          [5:5+N] Data payload
+          [5+N]   Checksum (sum of all preceding bytes, truncated to u8)
+        
+        The BMS continuously outputs frames. A trigger query (Modbus RTU) is sent
+        to initiate communication, but the BMS responds with 5AA5 frames, not
+        Modbus RTU responses.
+        """
+        port = self.ports[device]
+        consecutive_errors = 0
+        max_consecutive_errors = 10
+        trigger_counter = 0
+        
+        while self._running and port.is_open:
+            try:
+                if not port.serial_conn or not port.serial_conn.is_open:
+                    if not self.open_port(device):
+                        await asyncio.sleep(5)
+                        continue
+                
+                # Send trigger query every 10 reads to keep BMS awake
+                if trigger_counter % 10 == 0:
+                    trigger = jk_pb_build_trigger_query()
+                    port.serial_conn.write(trigger)
+                    await asyncio.sleep(0.1)
+                
+                trigger_counter += 1
+                
+                # Read available data (BMS streams frames continuously)
+                response_data = b""
+                timeout = time.time() + 0.5  # 500ms read window
+                while self._running and port.is_open and time.time() < timeout:
+                    if port.serial_conn.in_waiting > 0:
+                        response_data += port.serial_conn.read(port.serial_conn.in_waiting)
+                        if len(response_data) >= 100:  # Enough for multiple frames
+                            break
+                    await asyncio.sleep(0.01)
+                
+                if not response_data:
+                    # No data received
+                    port.error_count += 1
+                    consecutive_errors += 1
+                    if consecutive_errors >= max_consecutive_errors:
+                        port.health = DeviceHealth.ERROR
+                        self.close_port(device)
+                        await asyncio.sleep(5)
+                        continue
+                    await asyncio.sleep(0.1)
+                    continue
+                
+                # Process frames using the 5AA5 handler
+                metrics = jk_pb_process_frames(response_data)
+                
+                if not metrics:
+                    port.error_count += 1
+                    consecutive_errors += 1
+                    if consecutive_errors >= max_consecutive_errors:
+                        port.health = DeviceHealth.ERROR
+                    await asyncio.sleep(0.1)
+                    continue
+                
+                # Validate metrics
+                valid = True
+                error_msg = ""
+                for key, value in metrics.items():
+                    if isinstance(value, float) and (value != value or value == float('inf') or value == float('-inf')):
+                        valid = False
+                        error_msg = f"Invalid value for {key}"
+                        break
+                
+                if valid and metrics:
+                    port.last_valid_read = time.time()
+                    port.health = DeviceHealth.HEALTHY
+                    consecutive_errors = 0
+                
+                port.last_read = time.time()
+                port.total_reads += 1
+                
+                reading = InverterReading(
+                    timestamp=time.time(),
+                    port_name=port.name,
+                    device_id=port.device_fingerprint,
+                    device_type=port.inverter_type,
+                    metrics=metrics,
+                    raw_data=response_data[:200],
+                    valid=valid,
+                    error=error_msg,
+                    health=port.health,
+                )
+                self._add_reading(reading)
+                if callback:
+                    await callback(reading)
+                
+                # Polling interval (200ms = 5Hz update rate)
+                await asyncio.sleep(0.2)
+                    
+            except Exception as e:
+                port.error_count += 1
+                consecutive_errors += 1
+                port.health = DeviceHealth.ERROR
+                reading = InverterReading(
+                    timestamp=time.time(),
+                    port_name=port.name,
+                    device_id=port.device_fingerprint,
+                    device_type=port.inverter_type,
+                    metrics={},
+                    valid=False,
+                    error=str(e),
+                    health=DeviceHealth.ERROR,
+                )
+                self._add_reading(reading)
+                if callback:
+                    await callback(reading)
+                
+                self.close_port(device)
+                await asyncio.sleep(5)
     async def _read_jk_bms(self, device: str, callback: Optional[Callable] = None):
         """
         Read from a JK-BMS device using the custom 300-byte frame protocol.

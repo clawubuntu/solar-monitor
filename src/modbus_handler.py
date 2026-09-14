@@ -452,3 +452,148 @@ INVERTER_PROFILES = {
 def get_profile(name: str) -> InverterProfile:
     """Get inverter profile by name."""
     return INVERTER_PROFILES.get(name, INVERTER_PROFILES["generic"])
+
+
+# ============================================================================
+# JK-PB 5AA5 Protocol - Custom frame protocol (NOT Modbus RTU)
+# Used by: JK-PB2A16S20P at 115200 baud with 5AA5 frame delimiters
+# Physical: RS-485 via USB-serial adapter
+# Handler: jk_pb_5aa5_handler.py
+# ============================================================================
+# This profile exists for configuration/baudrate only.
+# Actual parsing is done by jk_pb_5aa5_handler.process_frames()
+
+JK_PB_5AA5_PROFILE = InverterProfile(
+    name="JK-PB2A16S20P (5AA5 Protocol)",
+    manufacturer="JK",
+    protocol="jk_pb_5aa5",
+    baudrate=115200,
+    slave_id=1,
+    registers=[],  # No register map - uses custom frame parsing
+)
+
+# Add to profiles dict
+INVERTER_PROFILES["jk_pb_5aa5"] = JK_PB_5AA5_PROFILE
+
+
+class JKPB5aa5Simulator:
+    """
+    Simulator for JK-PB 5AA5 frame protocol.
+    Generates realistic test data for dashboard testing.
+    """
+    
+    def __init__(self):
+        self.last_update = 0
+        self.cell_voltages = [3.350 + (i * 0.002) for i in range(16)]
+        self.pack_voltage = sum(self.cell_voltages)
+        self.current = 12.5
+        self.soc = 87
+        self.temp1 = 22
+        self.temp2 = 23
+        self.cycle_count = 142
+    
+    def update(self):
+        """Update simulated values with small random walk."""
+        import random
+        for i in range(len(self.cell_voltages)):
+            self.cell_voltages[i] += random.gauss(0, 0.001)
+            self.cell_voltages[i] = max(3.200, min(3.450, self.cell_voltages[i]))
+        self.pack_voltage = sum(self.cell_voltages)
+        self.current = 12.5 + random.gauss(0, 0.5)
+        self.soc = min(100, max(0, self.soc + random.gauss(0, 0.1)))
+        self.temp1 = 22 + random.gauss(0, 0.2)
+        self.temp2 = 23 + random.gauss(0, 0.2)
+        self.last_update = time.time()
+    
+    def read_data(self) -> bytes:
+        """Generate raw serial data with 5AA5 frames."""
+        import random
+        
+        self.update()
+        
+        # Build runtime data frame (0x2182)
+        runtime_frame = self._build_runtime_frame()
+        
+        # Build cell voltage frame (0x3982)
+        cell_frame = self._build_cell_frame()
+        
+        return runtime_frame + cell_frame
+    
+    def _build_runtime_frame(self) -> bytes:
+        """Build a 0x2182 runtime data frame."""
+        data = bytearray(16)
+        
+        # Pack voltage (LE u32, 0.01V)
+        pack_v_raw = int(self.pack_voltage * 100)
+        struct.pack_into('<I', data, 0, pack_v_raw)
+        
+        # Current (LE u16 signed, 0.1A)
+        current_raw = int(self.current * 10)
+        struct.pack_into('<H', data, 4, current_raw & 0xFFFF)
+        
+        # SOC
+        data[6] = int(self.soc)
+        
+        # Temps
+        data[7] = int(self.temp1) & 0xFF
+        data[8] = int(self.temp2) & 0xFF
+        
+        # Cell count
+        data[9] = 16
+        
+        # Remaining capacity (fake)
+        struct.pack_into('<H', data, 10, int(self.soc * 2.5 * 100))
+        
+        # Full capacity (fake: 250Ah)
+        struct.pack_into('<H', data, 12, 25000)
+        
+        # Cycle count
+        struct.pack_into('<H', data, 14, self.cycle_count)
+        
+        return self._frame_with_header(0x2182, bytes(data))
+    
+    def _build_cell_frame(self) -> bytes:
+        """Build a 0x3982 cell voltage frame."""
+        data = bytearray(1 + 16 * 2)
+        
+        # Starting cell index
+        data[0] = 0
+        
+        # Cell voltages (BE u16, 0.001V)
+        for i, v in enumerate(self.cell_voltages):
+            raw = int(v * 1000)
+            struct.pack_into('>H', data, 1 + i * 2, raw)
+        
+        return self._frame_with_header(0x3982, bytes(data))
+    
+    def _frame_with_header(self, frame_type: int, data: bytes) -> bytes:
+        """Wrap data in a 5AA5 frame with delimiter and checksum."""
+        frame = bytearray()
+        frame.extend([0x5A, 0xA5])  # Delimiter
+        frame.extend([(frame_type >> 8) & 0xFF, frame_type & 0xFF])  # Type (BE)
+        frame.append(len(data))  # Length
+        frame.extend(data)  # Data
+        frame.append(sum(frame) & 0xFF)  # Checksum
+        return bytes(frame)
+
+
+# Also override InverterSimulator to handle jk_pb_5aa5
+class InverterSimulatorJKPB(InverterSimulator):
+    """Extended simulator that also handles JK-PB 5AA5 protocol."""
+    
+    def __init__(self, profile):
+        super().__init__(profile)
+        self.jk_pb_sim = None
+        if profile.protocol == "jk_pb_5aa5":
+            self.jk_pb_sim = JKPB5aa5Simulator()
+    
+    def update(self):
+        if self.jk_pb_sim:
+            self.jk_pb_sim.update()
+        else:
+            super().update()
+    
+    def handle_request(self, request: bytes) -> bytes:
+        if self.jk_pb_sim:
+            return self.jk_pb_sim.read_data()
+        return super().handle_request(request)
