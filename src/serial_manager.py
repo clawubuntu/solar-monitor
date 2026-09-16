@@ -397,11 +397,24 @@ class SerialPortManager:
                     await asyncio.sleep(0.1)
                     continue
                 
-                # Build combined metrics for all 32 cells
+                # For parallel banks: voltage = average, current = sum
+                bank_voltages = []
+                for frame, ts in all_frames:
+                    parsed = jk_parse_frame(frame)
+                    if not parsed or parsed["frame_code"] != FRAME_RUNTIME_DATA:
+                        continue
+                    runtime = jk_parse_runtime_data(parsed["data"])
+                    cells = [c for c in runtime.get("cell_voltages", []) if c > 0.1]
+                    if cells:
+                        bank_voltages.append(sum(cells))
+                
+                avg_voltage = round(sum(bank_voltages) / len(bank_voltages), 2) if bank_voltages else 0
+                
+                # Build combined metrics
                 metrics = {
-                    "voltage": round(sum(all_cells), 2),
+                    "voltage": avg_voltage,
                     "current": round(total_current, 3),
-                    "power": round(sum(all_cells) * total_current, 2),
+                    "power": round(avg_voltage * total_current, 2),
                     "soc": round(sum(soc_values) / len(soc_values)) if soc_values else 0,
                     "temp1": round(max(temp1_values) if temp1_values else 0, 1),
                     "temp2": round(max(temp2_values) if temp2_values else 0, 1),
