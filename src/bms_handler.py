@@ -36,37 +36,65 @@ def parse_frame(frame:bytes)->Optional[Dict]:
     return{"frame_code":frame[4],"frame_name":FRAME_NAMES.get(frame[4],"Unknown"),"counter":frame[5],"data":frame[6:299]}
 
 def parse_runtime_data(data:bytes)->Dict:
-    r={}
-    # Cell voltages 1-16 at offsets 0-31 (frame 6-37)
-    r['cell_voltages']=[round(struct.unpack_from('<H',data,i*2)[0]*0.001,3)for i in range(16)]
-    # Cell voltages 17-32 at offsets 32-63 (frame 38-69)
-    r['cell_voltages_17_32']=[round(struct.unpack_from('<H',data,i*2)[0]*0.001,3)for i in range(16,32)]
-    # Average cell voltage at offset 68 (frame 74)
-    r['avg_cell_v']=struct.unpack_from('<H',data,68)[0]*0.001
-    # Voltage delta at offset 70 (frame 76)
-    r['volt_delta']=struct.unpack_from('<H',data,70)[0]*0.001
-    # SOC at offset 72 (frame 78)
-    r['soc']=struct.unpack_from('<H',data,72)[0]
-    # Current at offset 74 (frame 80) - signed, scale 0.01A
-    r['current']=struct.unpack_from('<h',data,74)[0]*0.01
-    # Pack voltage at offset 76 (frame 82) - scale 0.01V
-    r['voltage']=struct.unpack_from('<H',data,76)[0]*0.01
+    """Parse runtime frame 0x02 for JK-PB V19 (firmware V19.09).
+    
+    Verified offsets from live capture:
+      [0:32]   Cell voltages 1-16: u16 LE, ×0.001V
+      [32:64]  Cell voltages 17-32: u16 LE, ×0.001V (0 if unused)
+      [64:66]  Delimiter: 0xFFFF
+      [68:70]  Avg cell voltage: u16 LE, ×0.001V
+      [70:72]  Cell delta: u16 LE, ×0.001V
+      [72:74]  Current: i16 LE, ×0.001A (+ = charging)
+      [74:76]  SOC: u16 LE, %
+      [86:88]  Temp1: i16 LE, ×0.1°C
+      [88:90]  Temp2: i16 LE, ×0.1°C
+    Pack voltage = sum of valid cell voltages.
+    """
+    r = {}
+    
+    # Cell voltages 1-16
+    cells = []
+    for i in range(16):
+        raw = struct.unpack_from('<H', data, i * 2)[0]
+        cells.append(round(raw * 0.001, 3))
+    r['cell_voltages'] = cells
+    
+    # Cell voltages 17-32 (unused in 16-cell packs)
+    cells_17_32 = []
+    for i in range(16, 32):
+        raw = struct.unpack_from('<H', data, i * 2)[0]
+        cells_17_32.append(round(raw * 0.001, 3))
+    r['cell_voltages_17_32'] = cells_17_32
+    
+    # Average cell voltage
+    r['avg_cell_v'] = struct.unpack_from('<H', data, 68)[0] * 0.001
+    
+    # Cell delta (mV)
+    r['volt_delta'] = struct.unpack_from('<H', data, 70)[0] * 0.001
+    
+    # Current (signed, ×0.001A)
+    r['current'] = struct.unpack_from('<h', data, 72)[0] * 0.001
+    
+    # SOC (%)
+    r['soc'] = struct.unpack_from('<H', data, 74)[0]
+    
+    # Temperatures (×0.1°C)
+    r['temp1'] = struct.unpack_from('<h', data, 86)[0] * 0.1
+    r['temp2'] = struct.unpack_from('<h', data, 88)[0] * 0.1
+    
+    # Pack voltage = sum of valid cells
+    valid_cells = [c for c in cells if c > 0.1]
+    r['pack_v'] = round(sum(valid_cells), 2)
+    
     # Power
-    r['power']=r['voltage']*r['current']
-    # Temperature 1 at offset 78 (frame 84) - signed, scale 0.1°C
-    r['temp1']=struct.unpack_from('<h',data,78)[0]*0.1
-    # Temperature 2 at offset 80 (frame 86) - signed, scale 0.1°C
-    r['temp2']=struct.unpack_from('<h',data,80)[0]*0.1
-    # MOS temp at offset 82 (frame 88)
-    r['mos_temp']=struct.unpack_from('<h',data,82)[0]*0.1
-    # Remaining capacity at offset 84 (frame 90) - scale 0.01Ah
-    r['remaining_capacity']=struct.unpack_from('<H',data,84)[0]*0.01
-    # Full capacity at offset 86 (frame 92) - scale 0.01Ah
-    r['full_capacity']=struct.unpack_from('<H',data,86)[0]*0.01
-    # Cycle count at offset 88 (frame 94)
-    r['cycle_count']=struct.unpack_from('<H',data,88)[0]
-    # Cell count from number of non-zero cell voltages
-    r['cell_count']=sum(1 for v in r['cell_voltages'] if v > 0.1)
+    r['power'] = round(r['pack_v'] * r['current'], 2)
+    
+    # Cell count
+    r['cell_count'] = len(valid_cells)
+    
+    # Alias for API compatibility
+    r['voltage'] = r['pack_v']
+    
     return r
 
 def parse_config_data(data:bytes)->Dict:
