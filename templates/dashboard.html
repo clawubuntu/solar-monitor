@@ -1,194 +1,240 @@
 <!DOCTYPE html>
-<html><head><meta charset="UTF-8"><title>Solar Monitor</title>
-<style>
-body{font-family:sans-serif;background:#1a1a2e;color:#eee;margin:0}
-.header{background:#16213e;padding:1rem 2rem;display:flex;justify-content:space-between;align-items:center;border-bottom:2px solid #0f3460}
-.header h1{color:#e94560;font-size:1.5rem}
-.container{max-width:1400px;margin:0 auto;padding:2rem}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:1.5rem;margin-bottom:2rem}
-.card{background:#16213e;border-radius:8px;padding:1.5rem;border:1px solid #0f3460}
-.card h3{color:#e94560;margin-bottom:1rem;font-size:1rem}
-.metric{display:flex;justify-content:space-between;padding:0.5rem 0;border-bottom:1px solid #0f3460}
-.metric:last-child{border-bottom:none}
-.metric-label{color:#a0a0a0}
-.metric-value{font-weight:bold;font-size:1.125rem}
-.metric-value.positive{color:#00b894}
-.metric-value.negative{color:#d63031}
-.metric-value.neutral{color:#fdcb6e}
-.metric-value.stale{color:#636e72}
-.btn{padding:0.5rem 1rem;border:none;border-radius:4px;cursor:pointer;font-size:0.875rem;background:#e94560;color:white;margin-right:0.5rem;margin-bottom:0.5rem}
-.btn:hover{opacity:0.9}
-.btn-secondary{background:#0f3460}
-.status{display:flex;gap:1rem}
-.status span{padding:0.25rem 0.75rem;border-radius:4px;font-size:0.875rem}
-.status .online{background:#00b894}
-.status .offline{background:#d63031}
-input,select{padding:0.5rem;border-radius:4px;border:1px solid #0f3460;background:#1a1a2e;color:white;width:100%;margin-bottom:0.5rem;box-sizing:border-box}
-label{font-size:0.875rem;color:#a0a0a0;display:block;margin-bottom:0.25rem}
-.port-list{list-style:none;padding:0}
-.port-item{display:flex;justify-content:space-between;align-items:center;padding:0.75rem;background:#0f3460;border-radius:4px;margin-bottom:0.5rem}
-.port-status{font-size:0.75rem;padding:0.25rem 0.5rem;border-radius:4px}
-.port-status.open{background:#00b894}
-.port-status.closed{background:#d63031}
-.port-status.stale{background:#fdcb6e;color:#000}
-.port-status.error{background:#d63031}
-.port-status.disconnected{background:#636e72}
-.reading-log{max-height:300px;overflow-y:auto;font-family:monospace;font-size:0.75rem;background:#0f3460;padding:0.5rem;border-radius:4px}
-.log-entry{padding:0.25rem 0;border-bottom:1px solid #1a1a2e}
-.log-entry.error{color:#d63031}
-.log-entry.valid{color:#00b894}
-.log-entry.stale{color:#fdcb6e}
-.device-card{background:#0f3460;border-radius:8px;padding:1rem;margin-bottom:1rem;border:1px solid #1a1a2e}
-.device-name{color:#e94560;font-weight:bold;margin-bottom:0.5rem}
-.device-timestamp{color:#a0a0a0;font-size:0.75rem;margin-bottom:0.5rem}
-</style></head>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Solar Monitor</title>
+<link rel="stylesheet" href="/static/styles.css">
+</head>
 <body>
-<div class="header"><h1>Solar Monitor</h1><div class="status"><span class="online" id="ws-status">Live</span><span id="port-count">0 ports</span></div></div>
-<div class="container">
-<div class="grid">
-<div class="card"><h3>Serial Ports</h3><ul class="port-list" id="port-list"><li>No ports configured</li></ul></div>
-<div class="card"><h3>Add Port</h3>
-<label>Device</label><select id="port-device"><option value="">Select port...</option></select>
-<label>Name</label><input type="text" id="port-name" placeholder="e.g., Main Inverter">
-<label>Baud Rate</label><select id="port-baud"><option value="9600" selected>9600</option><option value="19200">19200</option><option value="38400">38400</option><option value="115200">115200</option></select>
-<label>Inverter Type</label><select id="port-profile"><option value="generic">Generic</option></select>
-<button class="btn" onclick="addPort()">Add Port</button>
-<button class="btn btn-secondary" onclick="addSimulator()">Add Simulator</button>
-</div></div>
-<div class="grid">
-<div class="card"><h3>Live Readings</h3><div id="live-readings"><p>Waiting for data...</p></div></div>
-<div class="card"><h3>Port Statistics</h3><div id="port-stats"><p>No statistics available</p></div></div>
+<div id="app">
+<!-- Sidebar -->
+<nav id="sidebar">
+<div class="sidebar-header">
+<h2>🔋 Solar Monitor</h2>
 </div>
-<div class="card"><h3>Reading Log</h3><div class="reading-log" id="reading-log"><p>No readings yet</p></div></div>
+<ul class="nav-list">
+<li class="nav-item active" data-page="overview"><a href="#overview">Overview</a></li>
+<li class="nav-item" data-page="batteries"><a href="#batteries">Batteries</a></li>
+<li class="nav-item" data-page="history"><a href="#history">History</a></li>
+<li class="nav-item" data-page="compare"><a href="#compare">Compare</a></li>
+<li class="nav-item" data-page="alerts"><a href="#alerts">Alerts</a></li>
+<li class="nav-item" data-page="system"><a href="#system">System</a></li>
+</ul>
+<div class="sidebar-status">
+<div id="ws-status" class="ws-status offline">● Offline</div>
+<div id="last-update">Last update: —</div>
 </div>
-<script>
-let ws, readings=[], devices={};
-function connectWS(){
-  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  ws = new WebSocket(proto + '//' + window.location.host + '/ws');
-  ws.onopen = () => {
-    document.getElementById('ws-status').textContent = 'Live';
-    document.getElementById('ws-status').className = 'online';
-  };
-  ws.onmessage = e => {
-    const msg = JSON.parse(e.data);
-    if (msg.type === 'reading') {
-      readings.unshift(msg.data);
-      if (readings.length > 100) readings.pop();
-      updateReadings();
-    } else if (msg.type === 'readings') {
-      // Batch update from initial connection
-      readings = msg.data;
-      updateReadings();
-    }
-  };
-  ws.onclose = () => {
-    document.getElementById('ws-status').textContent = 'Offline';
-    document.getElementById('ws-status').className = 'offline';
-    setTimeout(connectWS, 5000);
-  };
-}
-function updateReadings() {
-  const c = document.getElementById('live-readings');
-  if (readings.length === 0) return;
-  
-  // Group readings by device
-  devices = {};
-  readings.forEach(r => {
-    const key = r.port_name || 'unknown';
-    if (!devices[key] || r.timestamp > devices[key].timestamp) {
-      devices[key] = r;
-    }
-  });
-  
-  let h = '';
-  for (const [name, r] of Object.entries(devices)) {
-    const t = new Date(r.timestamp * 1000).toLocaleTimeString();
-    const health = r.health || 'unknown';
-    h += '<div class="device-card">';
-    h += '<div class="device-name">' + escapeHtml(name) + ' (' + escapeHtml(health) + ')</div>';
-    h += '<div class="device-timestamp">' + escapeHtml(t) + '</div>';
-    for (const [k, v] of Object.entries(r.metrics || {})) {
-      const n = parseFloat(v);
-      let cl = 'neutral';
-      if (n > 0) cl = 'positive';
-      if (n < 0) cl = 'negative';
-      h += '<div class="metric"><span class="metric-label">' + escapeHtml(k) + '</span><span class="metric-value ' + cl + '">' + escapeHtml(String(v)) + '</span></div>';
-    }
-    h += '</div>';
-  }
-  c.innerHTML = h;
-  
-  const log = document.getElementById('reading-log');
-  log.innerHTML = readings.slice(0, 50).map(r => {
-    const t = new Date(r.timestamp * 1000).toLocaleTimeString();
-    const v = r.valid ? 'valid' : 'error';
-    const m = Object.entries(r.metrics || {}).map(([k, v]) => escapeHtml(k) + ':' + escapeHtml(String(v))).join(', ');
-    return '<div class="log-entry ' + v + '">[' + escapeHtml(t) + '] ' + escapeHtml(r.port_name) + ': ' + m + '</div>';
-  }).join('');
-}
-function escapeHtml(s) {
-  const div = document.createElement('div');
-  div.textContent = s;
-  return div.innerHTML;
-}
-async function loadPorts() {
-  const r = await fetch('/api/ports');
-  const d = await r.json();
-  document.getElementById('port-count').textContent = d.registered.length + ' ports';
-  const l = document.getElementById('port-list');
-  if (d.registered.length === 0) {
-    l.innerHTML = '<li>No ports configured</li>';
-  } else {
-    l.innerHTML = d.registered.map(p => {
-      const h = p.health || 'disconnected';
-      return '<li class="port-item"><span>' + escapeHtml(p.name || p.device) + ' (' + escapeHtml(h) + ')</span><span class="port-status ' + escapeHtml(h) + '">' + h.toUpperCase() + '</span></li>';
-    }).join('');
-  }
-  const s = document.getElementById('port-device');
-  s.innerHTML = '<option value="">Select port...</option>' + d.available.map(p => '<option value="' + escapeHtml(p.device) + '">' + escapeHtml(p.device) + ' - ' + escapeHtml(p.description) + '</option>').join('');
-}
-async function addPort() {
-  const dev = document.getElementById('port-device').value;
-  const n = document.getElementById('port-name').value;
-  const b = parseInt(document.getElementById('port-baud').value);
-  const it = document.getElementById('port-profile').value;
-  if (!dev) return alert('Please select a port');
-  const r = await fetch('/api/ports', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({device: dev, name: n, baudrate: b, inverter_type: it})
-  });
-  if (r.ok) {
-    loadPorts();
-    document.getElementById('port-name').value = '';
-  }
-}
-async function addSimulator() {
-  const n = 'Simulator ' + (Date.now() % 1000);
-  const it = document.getElementById('port-profile').value;
-  const r = await fetch('/api/ports', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({device: 'sim://' + n, name: n, baudrate: 9600, inverter_type: it})
-  });
-  if (r.ok) loadPorts();
-}
-async function loadProfiles() {
-  const r = await fetch('/api/profiles');
-  const p = await r.json();
-  const s = document.getElementById('port-profile');
-  s.innerHTML = Object.entries(p).map(([k, v]) => '<option value="' + escapeHtml(k) + '">' + escapeHtml(v.manufacturer) + ' ' + escapeHtml(v.name) + '</option>').join('');
-}
-async function loadStats() {
-  const r = await fetch('/api/stats');
-  const s = await r.json();
-  const c = document.getElementById('port-stats');
-  if (s.length === 0) {
-    c.innerHTML = '<p>No statistics available</p>';
-  } else {
-    c.innerHTML = s.map(x => '<div class="metric"><span class="metric-label">' + escapeHtml(x.port_name) + '</span><span class="metric-value">' + x.total_readings + ' readings</span></div>').join('');
-  }
-}
-connectWS(); loadPorts(); loadProfiles(); loadStats(); setInterval(loadPorts, 5000); setInterval(loadStats, 10000);
-</script></body></html>
+</nav>
+
+<!-- Main content -->
+<main id="content">
+
+<!-- Overview page -->
+<section id="page-overview" class="page active">
+<div class="page-header">
+<h1>Overview</h1>
+</div>
+<div class="header-status">
+<span id="fresh-count">0 fresh</span> / <span id="total-count">0 total</span> batteries
+<span id="server-time"></span>
+</div>
+
+<!-- Attention panel -->
+<div id="attention-panel" class="attention-panel hidden">
+<h3>⚠ Attention Required</h3>
+<ul id="attention-list"></ul>
+</div>
+
+<!-- Summary cards -->
+<div class="summary-grid">
+<div class="summary-card">
+<div class="summary-label">Bank SOC</div>
+<div class="summary-value" id="bank-soc">—</div>
+</div>
+<div class="summary-card">
+<div class="summary-label">Remaining Energy</div>
+<div class="summary-value" id="bank-energy">—</div>
+</div>
+<div class="summary-card">
+<div class="summary-label">Net Power</div>
+<div class="summary-value" id="bank-power">—</div>
+</div>
+<div class="summary-card">
+<div class="summary-label">Data Coverage</div>
+<div class="summary-value" id="data-coverage">—</div>
+</div>
+</div>
+
+<!-- Battery table -->
+<div class="table-container">
+<table class="battery-table">
+<thead>
+<tr>
+<th>Name</th>
+<th>Status</th>
+<th>SOC</th>
+<th>Voltage</th>
+<th>Current</th>
+<th>Power</th>
+<th>Temp</th>
+<th>Cell Delta</th>
+<th>Age</th>
+</tr>
+</thead>
+<tbody id="battery-table-body">
+<tr><td colspan="9" class="empty-state">No batteries configured</td></tr>
+</tbody>
+</table>
+</div>
+
+<!-- Trends -->
+<div class="trends-section">
+<h3>Recent Trends</h3>
+<div id="trends-container" class="trends-grid"></div>
+</div>
+</section>
+
+<!-- Batteries page -->
+<section id="page-batteries" class="page">
+<div class="page-header">
+<h1>Batteries</h1>
+<div class="header-actions">
+<select id="battery-select" class="form-select"><option value="">Select battery...</option></select>
+</div>
+</div>
+<div id="battery-detail" class="battery-detail hidden">
+<!-- Tabs -->
+<div class="tabs">
+<button class="tab active" data-tab="summary">Summary</button>
+<button class="tab" data-tab="cells">Cells</button>
+<button class="tab" data-tab="settings">BMS Settings</button>
+<button class="tab" data-tab="diagnostics">Diagnostics</button>
+</div>
+
+<!-- Summary tab -->
+<div id="tab-summary" class="tab-content active">
+<div class="metrics-grid">
+<div class="metric"><label>SOC</label><span id="batt-soc">—</span></div>
+<div class="metric"><label>Voltage</label><span id="batt-voltage">—</span></div>
+<div class="metric"><label>Current</label><span id="batt-current">—</span></div>
+<div class="metric"><label>Power</label><span id="batt-power">—</span></div>
+<div class="metric"><label>Temp 1</label><span id="batt-temp1">—</span></div>
+<div class="metric"><label>Temp 2</label><span id="batt-temp2">—</span></div>
+</div>
+</div>
+
+<!-- Cells tab -->
+<div id="tab-cells" class="tab-content">
+<div id="cell-container" class="cell-container"></div>
+<div class="cell-stats">
+<span id="cell-min"></span>
+<span id="cell-max"></span>
+<span id="cell-delta"></span>
+<span id="cell-avg"></span>
+</div>
+</div>
+
+<!-- Settings tab -->
+<div id="tab-settings" class="tab-content">
+<table class="settings-table"><tbody id="settings-tbody"></tbody></table>
+</div>
+
+<!-- Diagnostics tab -->
+<div id="tab-diagnostics" class="tab-content">
+<pre id="diagnostics-content"></pre>
+</div>
+</div>
+</section>
+
+<!-- History page -->
+<section id="page-history" class="page">
+<div class="page-header">
+<h1>History</h1>
+</div>
+<div class="history-controls">
+<select id="history-device" class="form-select"><option value="">All devices</option></select>
+<select id="history-metric" class="form-select"><option value="voltage">Voltage</option><option value="current">Current</option><option value="soc">SOC</option><option value="temp1">Temp 1</option></select>
+<select id="history-range" class="form-select">
+<option value="1">1 hour</option>
+<option value="6">6 hours</option>
+<option value="24" selected>24 hours</option>
+<option value="168">7 days</option>
+</select>
+<button id="export-csv" class="btn btn-secondary">Export CSV</button>
+</div>
+<div id="history-chart" class="chart-container">
+<canvas id="history-canvas" width="800" height="300"></canvas>
+</div>
+<div id="history-info" class="chart-info"></div>
+</section>
+
+<!-- Compare page -->
+<section id="page-compare" class="page">
+<div class="page-header">
+<h1>Compare</h1>
+</div>
+<div class="compare-controls">
+<select id="compare-device-1" class="form-select"></select>
+<select id="compare-device-2" class="form-select"></select>
+<label><input type="checkbox" id="differences-only"> Differences only</label>
+</div>
+<div id="compare-results" class="compare-results">
+<table class="compare-table"><tbody id="compare-tbody"></tbody></table>
+</div>
+</section>
+
+<!-- Alerts page -->
+<section id="page-alerts" class="page">
+<div class="page-header">
+<h1>Alerts</h1>
+</div>
+<div id="alerts-container">
+<div id="active-alerts" class="alerts-section">
+<h3>Active</h3>
+<ul id="active-alerts-list"></ul>
+</div>
+<div id="resolved-alerts" class="alerts-section">
+<h3>Resolved</h3>
+<ul id="resolved-alerts-list"></ul>
+</div>
+</div>
+</section>
+
+<!-- System page -->
+<section id="page-system" class="page">
+<div class="page-header">
+<h1>System</h1>
+</div>
+<div class="system-grid">
+<div class="system-card">
+<h3>Serial Ports</h3>
+<div id="ports-config"></div>
+</div>
+<div class="system-card">
+<h3>Add Port</h3>
+<form id="add-port-form" class="add-port-form">
+<label>Device</label><select name="device" id="new-port-device"></select>
+<label>Name</label><input type="text" name="name" placeholder="e.g., Yixiang 1">
+<label>Baud Rate</label><select name="baudrate"><option value="115200" selected>115200</option><option value="9600">9600</option></select>
+<label>Protocol</label><select name="protocol"><option value="jk_bms">JK-BMS 5AA5</option><option value="modbus_rtu">Modbus RTU</option></select>
+<button type="submit" class="btn btn-primary">Add Port</button>
+</form>
+</div>
+<div class="system-card">
+<h3>System Stats</h3>
+<pre id="system-stats"></pre>
+</div>
+<div class="system-card">
+<h3>Audit Log</h3>
+<ul id="audit-log"></ul>
+</div>
+</div>
+</section>
+
+</main>
+</div>
+
+<script src="/static/dashboard.js"></script>
+</body>
+</html>

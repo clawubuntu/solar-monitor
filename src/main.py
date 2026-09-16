@@ -4,10 +4,9 @@ Solar Monitor - Main Application
 Multi-serial solar monitoring platform with REST API, WebSocket, and web dashboard.
 
 Features:
-- Equipment writes disabled by default (enable with ENABLE_WRITES=true)
-- Single config store (SQLite)
-- Proper Modbus transactions with acknowledgment
-- Wired automation engine with action handlers
+- Equipment writes disabled by default
+- SQLite storage with per-device snapshot API
+- Multi-page dashboard: Overview, Batteries, History, Compare, Alerts, System
 """
 import asyncio
 import json
@@ -17,10 +16,11 @@ import html
 import logging
 from typing import Dict, List, Optional
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request
 from fastapi.responses import HTMLResponse
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from fastapi.staticfiles import StaticFiles
 import uvicorn
 
 from serial_manager import SerialPortManager, SerialPort, ProtocolType, InverterReading, DeviceHealth
@@ -28,44 +28,41 @@ from modbus_handler import ModbusRTU, INVERTER_PROFILES, get_profile, InverterSi
 from database import SolarDatabase
 from automations import AutomationEngine, AutomationRule
 
-# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Configuration
 ENABLE_WRITES = os.environ.get("ENABLE_WRITES", "false").lower() == "true"
 
-# Initialize components
 serial_manager = SerialPortManager()
 db = SolarDatabase()
 automation_engine = AutomationEngine()
 
-# Register automation action handler
+DASHBOARD_DIR = Path(__file__).parent / "templates"
+
+
 def handle_automation_action(action: Dict):
-    """Handle automation actions (e.g., send command, log alert)."""
-    logger.info(f"Automation action: {action}")
     action_type = action.get("type", "")
     if action_type == "alert":
         logger.warning(f"ALERT: {action.get('message', '')}")
     elif action_type == "command":
-        # Hardware commands disabled until tested
-        logger.warning(f"Command action blocked (hardware commands disabled): {action}")
+        logger.warning(f"Command action blocked (disabled): {action}")
+
 
 automation_engine.on_action(handle_automation_action)
 
-# WebSocket connection manager
+
 class ConnectionManager:
     def __init__(self):
         self.active_connections: List[WebSocket] = []
-    
+
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
         self.active_connections.append(websocket)
-    
+
     def disconnect(self, websocket: WebSocket):
         if websocket in self.active_connections:
             self.active_connections.remove(websocket)
-    
+
     async def broadcast(self, message: Dict):
         disconnected = []
         for connection in self.active_connections:
@@ -76,12 +73,12 @@ class ConnectionManager:
         for conn in disconnected:
             self.disconnect(conn)
 
+
 ws_manager = ConnectionManager()
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup and shutdown events."""
-    # Load saved port configurations from SQLite (single source of truth)
     configs = db.get_port_configs()
     for config in configs:
         port = SerialPort(
@@ -96,41 +93,163 @@ async def lifespan(app: FastAPI):
             max_stale_seconds=config.get("max_stale_seconds", 30.0),
         )
         serial_manager.add_port(port)
-    
-    # Log configuration
+
     logger.info(f"Equipment writes enabled: {ENABLE_WRITES}")
     logger.info(f"Loaded {len(configs)} port configs")
-    
-    # Start reading task
+
     asyncio.create_task(read_all_ports())
-    
+
     yield
-    
-    # Cleanup
+
     await serial_manager.stop()
 
-app = FastAPI(title="Solar Monitor", version="1.0.0", lifespan=lifespan)
 
-# REST API Endpoints
+app = FastAPI(title="Solar Monitor", version="2.0.0", lifespan=lifespan)
 
-@app.get("/", response_class=HTMLResponse)
-async def dashboard(request: Request):
-    """Main dashboard page - served as static HTML."""
-    with open("templates/dashboard.html", "r") as f:
-        content = f.read()
-    return HTMLResponse(content=content)
+# Mount static files
+static_dir = Path(__file__).parent.parent / "static"
+if static_dir.exists():
+    app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+
+# ─── REST API ───────────────────────────────────────────────
+
+@app.get("/api/devices")
+async def get_devices():
+    """Get complete device inventory with latest values."""
+    snapshots = db.get_device_snapshot()
+    devices = []
+    for device_id, snap in snapshots.items():
+        # Get port config for name
+        port_config = None
+        for p in db.get_port_configs():
+            if p.get("device_fingerprint") == device_id:
+                port_config = p
+                break
+        
+        last_valid = snap.get("last_valid_read", 0)
+        age_seconds = time.time() - last_valid if last_valid > 0 else float('inf')
+        
+        # Determine if stale
+        max_stale = 30.0
+        if port_config:
+            max_stale = port_config.get("max_stale_seconds", 30.0)
+        
+        is_stale = age_seconds > max_stale
+        
+        devices.append({
+            "device_id": device_id,
+            "name": port_config.get("name", snap.get("port_name", device_id[:8])) if port_config else snap.get("port_name", device_id[:8]),
+            "port_name": snap.get("port_name", ""),
+            "device_type": snap.get("device_type", ""),
+            "health": snap.get("health", "disconnected"),
+            "is_stale": is_stale,
+            "last_valid_read": last_valid,
+            "age_seconds": age_seconds,
+            "metrics": snap.get("latest_values", {}),
+            "timestamps": snap.get("latest_timestamps", {}),
+        })
+    
+    return {"devices": devices, "server_time": time.time()}
+
+
+@app.get("/api/devices/{device_id}")
+async def get_device_detail(device_id: str):
+    """Get detailed snapshot for a single device."""
+    snapshots = db.get_device_snapshot()
+    if device_id not in snapshots:
+        raise HTTPException(404, "Device not found")
+    
+    snap = snapshots[device_id]
+    last_valid = snap.get("last_valid_read", 0)
+    
+    return {
+        "device_id": device_id,
+        "name": snap.get("port_name", device_id[:8]),
+        "device_type": snap.get("device_type", ""),
+        "health": snap.get("health", "disconnected"),
+        "last_valid_read": last_valid,
+        "metrics": snap.get("latest_values", {}),
+        "timestamps": snap.get("latest_timestamps", {}),
+    }
+
+
+@app.get("/api/history")
+async def get_history(
+    device_id: str = None,
+    metric: str = None,
+    hours: int = 24,
+    start: float = None,
+    end: float = None,
+    limit: int = 10000
+):
+    """Get historical readings with bounded time range."""
+    now = time.time()
+    if start is None:
+        start = now - (hours * 3600)
+    if end is None:
+        end = now
+    
+    # Enforce max range (30 days)
+    max_range = 30 * 86400
+    if end - start > max_range:
+        start = end - max_range
+    
+    port_name = None
+    if device_id:
+        for p in db.get_port_configs():
+            if p.get("device_id") == device_id:
+                port_name = p.get("name", "")
+                break
+    
+    readings = db.get_history(
+        port_name=port_name,
+        start_time=start,
+        end_time=end,
+        limit=limit
+    )
+    
+    # Filter by metric if specified
+    if metric:
+        filtered = []
+        for r in readings:
+            if metric in r.get("metrics", {}):
+                filtered.append({
+                    "timestamp": r["timestamp"],
+                    "value": r["metrics"][metric],
+                })
+        readings = filtered
+    
+    return {
+        "readings": readings,
+        "start": start,
+        "end": end,
+        "count": len(readings),
+        "hours": hours,
+        "coverage": "complete" if len(readings) < limit else "truncated",
+    }
+
+
+@app.get("/api/readings")
+async def get_readings(port_name: str = None, limit: int = 100):
+    """Get latest readings (legacy endpoint for compatibility)."""
+    if port_name:
+        readings = db.get_readings(port_name=port_name, limit=limit)
+    else:
+        readings = db.get_latest_readings(limit)
+    return readings
+
 
 @app.get("/api/ports")
 async def get_ports():
     """Get all registered ports and their status."""
     return {
         "registered": serial_manager.get_port_status(),
-        "available": serial_manager.list_available_ports()
+        "available": serial_manager.list_available_ports(),
     }
+
 
 @app.post("/api/ports")
 async def add_port(config: Dict):
-    """Add a new serial port."""
     port = SerialPort(
         device=config["device"],
         baudrate=config.get("baudrate", 9600),
@@ -138,7 +257,7 @@ async def add_port(config: Dict):
         stopbits=config.get("stopbits", 1),
         protocol=ProtocolType(config.get("protocol", "modbus_rtu")),
         inverter_type=config.get("inverter_type", "generic"),
-        name=config.get("name", "")
+        name=config.get("name", ""),
     )
     if serial_manager.add_port(port):
         db.save_port_config({
@@ -153,103 +272,49 @@ async def add_port(config: Dict):
             "max_stale_seconds": port.max_stale_seconds,
         })
         db.log_audit("port_added", config["device"], f"Name: {config.get('name', '')}")
-        
-        # Start reader task for this port
         if port.is_open:
             asyncio.create_task(serial_manager.read_port(port.device, on_reading))
-        
         return {"status": "ok", "message": f"Port {port.device} added"}
     raise HTTPException(status_code=400, detail="Port already exists")
 
+
 @app.delete("/api/ports/{device:path}")
 async def remove_port(device: str):
-    """Remove a serial port."""
+    if not device.startswith("/"):
+        device = "/" + device
     serial_manager.remove_port(device)
-    # Also remove from SQLite (single source of truth)
     db.delete_port_config(device)
-    # Remove from JSON state if it exists
-    state_file = serial_manager._data_dir / "ports.json"
-    if state_file.exists():
-        try:
-            data = json.loads(state_file.read_text())
-            data["ports"] = [p for p in data.get("ports", []) if p["device"] != device]
-            state_file.write_text(json.dumps(data, indent=2))
-        except Exception:
-            pass
     db.log_audit("port_removed", device)
     return {"status": "ok"}
 
+
 @app.post("/api/ports/{device:path}/open")
 async def open_port(device: str):
-    """Open a serial port and start its reader task."""
-    # Handle URL path stripping leading slash
     if not device.startswith("/"):
         device = "/" + device
     if serial_manager.open_port(device):
         db.log_audit("port_opened", device)
-        # Start a reader task for this port (only if not already running)
         if device not in serial_manager._tasks:
             asyncio.create_task(serial_manager.read_port(device, on_reading))
         return {"status": "ok", "message": f"Port {device} opened"}
     raise HTTPException(status_code=400, detail="Failed to open port")
 
+
 @app.post("/api/ports/{device:path}/close")
 async def close_port(device: str):
-    """Close a serial port."""
     if not device.startswith("/"):
         device = "/" + device
     serial_manager.close_port(device)
     db.log_audit("port_closed", device)
     return {"status": "ok"}
 
-@app.get("/api/readings")
-async def get_readings(port_name: str = None, limit: int = 100):
-    """Get latest readings."""
-    if port_name:
-        readings = db.get_readings(port_name=port_name, limit=limit)
-    else:
-        readings = db.get_latest_readings(limit)
-    return readings
-
-@app.get("/api/readings/history")
-async def get_history(port_name: str = None, hours: int = 24):
-    """Get historical readings."""
-    end_time = time.time()
-    start_time = end_time - (hours * 3600)
-    readings = db.get_readings(
-        port_name=port_name,
-        start_time=start_time,
-        end_time=end_time,
-        limit=10000
-    )
-    return readings
-
-@app.get("/api/stats")
-async def get_stats():
-    """Get port statistics."""
-    return db.get_port_stats()
-
-@app.get("/api/profiles")
-async def get_profiles():
-    """Get available inverter profiles."""
-    return {
-        name: {
-            "name": profile.name,
-            "manufacturer": profile.manufacturer,
-            "protocol": profile.protocol,
-            "baudrate": profile.baudrate,
-            "slave_id": profile.slave_id,
-            "register_count": len(profile.registers)
-        }
-        for name, profile in INVERTER_PROFILES.items()
-    }
 
 @app.post("/api/ports/{device:path}/send")
 async def send_data(device: str, data: Dict):
-    """Send data to a port with validation. DISABLED by default."""
     if not ENABLE_WRITES:
-        raise HTTPException(status_code=403, detail="Equipment writes disabled. Set ENABLE_WRITES=true to enable.")
-    
+        raise HTTPException(status_code=403, detail="Equipment writes disabled.")
+    if not device.startswith("/"):
+        device = "/" + device
     if "hex" in data:
         try:
             bytes_data = bytes.fromhex(data["hex"])
@@ -259,127 +324,108 @@ async def send_data(device: str, data: Dict):
         bytes_data = bytes(data["bytes"])
     else:
         raise HTTPException(status_code=400, detail="No data provided")
-    
     if len(bytes_data) > 256:
         raise HTTPException(status_code=400, detail="Data too large (max 256 bytes)")
-    
     if serial_manager.send_data(device, bytes_data):
         db.log_audit("data_sent", device, f"{len(bytes_data)} bytes")
         return {"status": "ok"}
-    raise HTTPException(status_code=400, detail="Failed to send data")
+    raise HTTPException(status_code=400, detail="Failed to send")
 
-@app.post("/api/ports/{device:path}/control")
-async def control_inverter(device: str, command: Dict):
-    """
-    Send control command to inverter with model-specific limits,
-    acknowledgment/readback, and audit trail.
-    DISABLED by default.
-    """
-    if not ENABLE_WRITES:
-        raise HTTPException(status_code=403, detail="Equipment writes disabled. Set ENABLE_WRITES=true to enable.")
-    
-    # Validate command
-    register = command.get("register")
-    value = command.get("value")
-    
-    if register is None or value is None:
-        raise HTTPException(status_code=400, detail="register and value required")
-    
-    # Get port and profile
-    if device not in serial_manager.ports:
-        raise HTTPException(status_code=404, detail="Port not found")
-    
-    port = serial_manager.ports[device]
-    profile = get_profile(port.inverter_type)
-    
-    # Check register limits - REJECT unknown registers
-    reg_map = profile.get_register_map()
-    if register not in reg_map:
-        raise HTTPException(status_code=400, detail=f"Unknown register {register} for profile {port.inverter_type}")
-    
-    reg = reg_map[register]
-    if not reg.writable:
-        raise HTTPException(status_code=400, detail="Register is read-only")
-    if reg.min_value is not None and value < reg.min_value:
-        raise HTTPException(status_code=400, detail=f"Value below minimum ({reg.min_value})")
-    if reg.max_value is not None and value > reg.max_value:
-        raise HTTPException(status_code=400, detail=f"Value above maximum ({reg.max_value})")
-    
-    # Build Modbus write command
-    slave_id = profile.slave_id
-    frame = ModbusRTU.build_write_single_register(slave_id, register, value)
-    
-    # Send command
-    if not serial_manager.send_data(device, frame):
-        db.log_audit("control_failed", device, f"Register {register} = {value}", success=False)
-        raise HTTPException(status_code=400, detail="Failed to send command")
-    
-    # Log to audit trail
-    db.log_audit("control_sent", device, f"Register {register} = {value}")
-    
+
+@app.get("/api/stats")
+async def get_stats():
+    return db.get_port_stats()
+
+
+@app.get("/api/profiles")
+async def get_profiles():
     return {
-        "status": "ok",
-        "message": f"Command sent to {device}",
-        "register": register,
-        "value": value
+        name: {
+            "name": p.name,
+            "manufacturer": p.manufacturer,
+            "protocol": p.protocol,
+            "baudrate": p.baudrate,
+            "slave_id": p.slave_id,
+        }
+        for name, p in INVERTER_PROFILES.items()
     }
+
 
 @app.get("/api/audit")
 async def get_audit_log(limit: int = 100):
-    """Get audit log."""
     return db.get_audit_log(limit)
+
 
 @app.get("/api/automations")
 async def get_automations():
-    """Get automation rules."""
     return automation_engine.get_rules()
+
 
 @app.post("/api/automations")
 async def add_automation(rule: Dict):
-    """Add automation rule."""
     new_rule = automation_engine.add_rule(
         name=rule["name"],
         condition=rule["condition"],
-        action=rule["action"]
+        action=rule["action"],
     )
     db.log_audit("automation_added", None, f"Rule: {rule['name']}")
     return {"status": "ok", "rule": new_rule}
 
+
 @app.delete("/api/automations/{rule_id}")
 async def remove_automation(rule_id: int):
-    """Remove automation rule."""
     automation_engine.remove_rule(rule_id)
     db.log_audit("automation_removed", None, f"Rule ID: {rule_id}")
     return {"status": "ok"}
 
-# WebSocket endpoint for live data
+
+# ─── WebSocket ──────────────────────────────────────────────
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await ws_manager.connect(websocket)
     try:
         while True:
-            readings = db.get_latest_readings(10)
+            # Send per-device snapshots instead of last-10
+            snapshots = db.get_device_snapshot()
+            devices = []
+            for device_id, snap in snapshots.items():
+                port_config = None
+                for p in db.get_port_configs():
+                    if p.get("device_fingerprint") == device_id:
+                        port_config = p
+                        break
+                last_valid = snap.get("last_valid_read", 0)
+                age = time.time() - last_valid if last_valid > 0 else float('inf')
+                devices.append({
+                    "device_id": device_id,
+                    "name": port_config.get("name", snap.get("port_name", device_id[:8])) if port_config else device_id[:8],
+                    "health": snap.get("health", "disconnected"),
+                    "is_stale": age > 30,
+                    "age_seconds": age,
+                    "metrics": snap.get("latest_values", {}),
+                })
+            
             await websocket.send_json({
-                "type": "readings",
-                "data": readings,
-                "timestamp": time.time()
+                "type": "snapshot",
+                "data": devices,
+                "server_time": time.time(),
             })
             await asyncio.sleep(1)
     except WebSocketDisconnect:
         ws_manager.disconnect(websocket)
 
-# Background task callback for handling readings
+
+# ─── Reading callback ───────────────────────────────────────
+
 async def on_reading(reading: InverterReading):
-    """Callback for when a reading is received from any port."""
-    # Validate reading before storing
     if reading.valid and reading.metrics:
-        # Check for invalid values (NaN, Inf)
         for key, value in reading.metrics.items():
             if isinstance(value, float) and (value != value or value == float('inf') or value == float('-inf')):
                 reading.valid = False
                 reading.error = f"Invalid value for {key}"
                 break
-    
+
     db.store_reading({
         "timestamp": reading.timestamp,
         "port_name": reading.port_name,
@@ -389,31 +435,34 @@ async def on_reading(reading: InverterReading):
         "raw_data": reading.raw_data,
         "valid": reading.valid,
         "error": reading.error,
-        "health": reading.health.value
+        "health": reading.health.value,
     })
-    
-    # Evaluate automations (only with valid data)
+
     if reading.valid:
         readings_dict = {reading.port_name: reading.metrics}
         automation_engine.evaluate_rules(readings_dict)
-    
-    await ws_manager.broadcast({
-        "type": "reading",
-        "data": {
-            "timestamp": reading.timestamp,
-            "port_name": reading.port_name,
-            "device_id": reading.device_id,
-            "device_type": reading.device_type,
-            "metrics": reading.metrics,
-            "valid": reading.valid,
-            "health": reading.health.value
-        }
-    })
 
-# Background task to read from all ports
+
 async def read_all_ports():
-    """Read from all open ports and store data."""
     await serial_manager.start(on_reading)
+
+
+# ─── Dashboard ──────────────────────────────────────────────
+
+@app.get("/", response_class=HTMLResponse)
+async def dashboard(request: Request):
+    return HTMLResponse(content=open(DASHBOARD_DIR / "dashboard.html").read())
+
+
+@app.get("/batteries/{device_id}", response_class=HTMLResponse)
+async def battery_detail(request: Request, device_id: str):
+    return HTMLResponse(content=open(DASHBOARD_DIR / "dashboard.html").read())
+
+
+@app.get("/{page}", response_class=HTMLResponse)
+async def page(request: Request, page: str):
+    return HTMLResponse(content=open(DASHBOARD_DIR / "dashboard.html").read())
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

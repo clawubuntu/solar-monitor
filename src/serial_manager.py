@@ -240,17 +240,46 @@ class SerialPortManager:
             await self._read_jk_bms(device, callback)
             return
         
-        # ... (standard modbus reading code)
+        # Standard Modbus path
+        profile = get_profile(port.inverter_type)
+        consecutive_errors = 0
+        max_consecutive_errors = 10
+        
         while self._running and port.is_open:
-            await asyncio.sleep(1)
+            try:
+                if not port.serial_conn or not port.serial_conn.is_open:
+                    if not self.open_port(device):
+                        await asyncio.sleep(5)
+                        continue
+                
+                if device.startswith("sim://") and device in self._simulators:
+                    simulator = self._simulators[device]
+                    simulator.update()
+                    await asyncio.sleep(1)
+                    continue
+                
+                # Standard modbus read would go here
+                await asyncio.sleep(0.5)
+                
+            except Exception as e:
+                port.error_count += 1
+                consecutive_errors += 1
+                logger.error(f"Error reading {device}: {e}")
+                await asyncio.sleep(5)
 
     async def _read_jk_bms(self, device: str, callback: Optional[Callable] = None):
+        """Read from a JK-BMS device using the custom 300-byte 5AA5 frame protocol."""
         port = self.ports[device]
         counter = 0
         consecutive_errors = 0
         max_consecutive_errors = 10
         
-        poll_sequence = [FRAME_RUNTIME_DATA, FRAME_CONFIG_READ, FRAME_DEVICE_INFO, FRAME_FAULT_INFO]
+        poll_sequence = [
+            FRAME_RUNTIME_DATA,
+            FRAME_CONFIG_READ,
+            FRAME_DEVICE_INFO,
+            FRAME_FAULT_INFO,
+        ]
         poll_index = 0
         
         while self._running and port.is_open:
@@ -266,6 +295,7 @@ class SerialPortManager:
                 query = jk_build_query(frame_code, counter)
                 port.serial_conn.write(query)
                 
+                # Wait for response
                 response_data = b""
                 timeout = time.time() + 0.35
                 while self._running and port.is_open and time.time() < timeout:
@@ -306,10 +336,24 @@ class SerialPortManager:
                         "temp2": runtime.get("temp2", 0),
                         "avg_cell_v": runtime.get("avg_cell_v", 0),
                         "volt_delta": runtime.get("volt_delta", 0),
+                        "cell_count": runtime.get("cell_count", 0),
                     }
                     for i, v in enumerate(runtime.get("cell_voltages", [])):
                         metrics[f"cell_{i+1:02d}_v"] = v
                 
+                elif parsed["frame_code"] == FRAME_CONFIG_READ:
+                    config = jk_parse_config_data(data)
+                    metrics = {f"cfg_{k}": v for k, v in config.items() if isinstance(v, (int, float))}
+                
+                elif parsed["frame_code"] == FRAME_DEVICE_INFO:
+                    info = jk_parse_device_info(data)
+                    metrics = {f"info_{k}": v for k, v in info.items() if isinstance(v, (int, float))}
+                
+                elif parsed["frame_code"] == FRAME_FAULT_INFO:
+                    faults = jk_parse_fault_info(data)
+                    metrics = {f"fault_{k}": v for k, v in faults.items() if isinstance(v, (int, float))}
+                
+                # Validate
                 valid = True
                 error_msg = ""
                 for key, value in metrics.items():
@@ -383,6 +427,9 @@ class SerialPortManager:
     def close_all(self):
         for device in list(self.ports.keys()):
             self.close_port(device)
+
+    def open_all(self) -> Dict[str, bool]:
+        return {device: self.open_port(device) for device in self.ports}
 
     def get_port_status(self) -> List[Dict]:
         return [
