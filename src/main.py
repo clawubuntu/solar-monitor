@@ -37,7 +37,7 @@ serial_manager = SerialPortManager()
 db = SolarDatabase()
 automation_engine = AutomationEngine()
 
-DASHBOARD_DIR = Path(__file__).parent.parent / "templates"
+DASHBOARD_DIR = Path(__file__).resolve().parent.parent / "templates"
 
 
 def handle_automation_action(action: Dict):
