@@ -275,11 +275,10 @@ class SerialPortManager:
                 await asyncio.sleep(5)
 
     async def _read_jk_bms(self, device: str, callback: Optional[Callable] = None):
-        """Read from JK-BMS device(s) using 300-byte 5AA5 frames.
+        """Read from JK-BMS device using 300-byte 5AA5 frames.
         
-        For parallel battery setups, the master BMS broadcasts its own data,
-        then queries all slave devices. We collect all frames after a trigger
-        and combine them into a single reading with 32 cells.
+        For parallel battery setups, the master BMS frame contains all cell data
+        for both master and slave banks packed into a single 300-byte frame.
         """
         port = self.ports[device]
         counter = 0
@@ -304,30 +303,25 @@ class SerialPortManager:
                 frame_code = poll_sequence[poll_index % len(poll_sequence)]
                 poll_index += 1
                 
-                # Build and send trigger to master (addr 0x00)
-                # This causes master to broadcast and query slaves
+                # Send trigger to wake up bus
                 trigger = jk_build_modbus_trigger()
                 port.serial_conn.write(trigger)
+                await asyncio.sleep(0.02)
                 
-                # Wait briefly for master to process
-                await asyncio.sleep(0.05)
-                
-                # Send 5AA5 query to trigger slave responses
+                # Send 5AA5 query
                 query = jk_build_query(frame_code, counter)
                 port.serial_conn.write(query)
                 
-                # Wait for ALL frames (master + slaves) over 2 seconds
-                all_frames = []  # List of (raw_bytes, timestamp)
-                deadline = time.time() + 2.0
+                # Wait for response frame(s)
+                all_frames = []
+                deadline = time.time() + 1.5
                 current_frame = b""
                 
                 while self._running and port.is_open and time.time() < deadline:
                     if port.serial_conn.in_waiting > 0:
                         current_frame += port.serial_conn.read(port.serial_conn.in_waiting)
                         
-                        # Check for complete 300-byte frames
                         while len(current_frame) >= 300:
-                            # Find frame start (55 AA EB 90)
                             idx = current_frame.find(b'\x55\xAA\xEB\x90')
                             if idx == -1:
                                 current_frame = b""
@@ -354,83 +348,57 @@ class SerialPortManager:
                     await asyncio.sleep(0.1)
                     continue
                 
-                # Parse frames and combine cells from master + slaves
-                # Master frame has cells 1-16, slave frames have cells 17-32
+                # Parse the master frame (first runtime frame)
                 metrics = {}
-                master_cells = []
-                slave_cells = []
-                avg_cell_v = 0
-                volt_delta = 0
-                total_current = 0
-                total_power = 0
-                soc_values = []
-                temp1_values = []
-                temp2_values = []
-                bank_count = 0
+                master_frame = None
                 
                 for frame, ts in all_frames:
                     parsed = jk_parse_frame(frame)
-                    if not parsed or parsed["frame_code"] != FRAME_RUNTIME_DATA:
+                    if not parsed:
                         continue
                     
-                    data = parsed["data"]
-                    runtime = jk_parse_runtime_data(data)
-                    cells = runtime.get("cell_voltages", [])
-                    valid_cells = [c for c in cells if c > 0.1]
-                    
-                    if not valid_cells:
-                        continue
-                    
-                    # First frame is master (address 0x00), rest are slaves
-                    if bank_count == 0:
-                        master_cells = valid_cells
-                    else:
-                        slave_cells.extend(valid_cells)
-                    
-                    avg_cell_v = runtime.get("avg_cell_v", avg_cell_v)
-                    volt_delta = max(volt_delta, runtime.get("volt_delta", 0))
-                    total_current += runtime.get("current", 0)
-                    total_power += runtime.get("power", 0)
-                    soc_values.append(runtime.get("soc", 0))
-                    temp1_values.append(runtime.get("temp1", 0))
-                    temp2_values.append(runtime.get("temp2", 0))
-                    bank_count += 1
+                    if parsed["frame_code"] == FRAME_RUNTIME_DATA:
+                        master_frame = frame
+                        break
                 
-                if not master_cells:
+                if not master_frame:
                     port.error_count += 1
                     consecutive_errors += 1
-                    if consecutive_errors >= max_consecutive_errors:
-                        port.health = DeviceHealth.ERROR
                     await asyncio.sleep(0.1)
                     continue
                 
-                all_cells = master_cells + slave_cells
+                # Decode the master frame (contains all 32 cells)
+                data = master_frame[6:299]
+                runtime = jk_parse_runtime_data(data)
                 
-                # For parallel banks: voltage = average, current = sum
-                bank_voltages = [sum(master_cells)]
-                if slave_cells:
-                    bank_voltages.append(sum(slave_cells))
-                avg_voltage = round(sum(bank_voltages) / len(bank_voltages), 2)
+                # Build metrics from single frame
+                all_cells = runtime.get("cell_voltages", []) + runtime.get("cell_voltages_17_32", [])
+                valid_cells = [c for c in all_cells if c > 0.1]
                 
-                # Build combined metrics
+                if not valid_cells:
+                    port.error_count += 1
+                    consecutive_errors += 1
+                    await asyncio.sleep(0.1)
+                    continue
+                
+                # For parallel banks: voltage = average bank voltage
+                pack_voltage = round(sum(valid_cells) / len(valid_cells) * 16, 2) if len(valid_cells) == 32 else round(sum(valid_cells), 2)
+                
                 metrics = {
-                    "voltage": avg_voltage,
-                    "current": round(total_current, 3),
-                    "power": round(avg_voltage * total_current, 2),
-                    "soc": round(sum(soc_values) / len(soc_values)) if soc_values else 0,
-                    "temp1": round(max(temp1_values) if temp1_values else 0, 1),
-                    "temp2": round(max(temp2_values) if temp2_values else 0, 1),
-                    "avg_cell_v": round(avg_cell_v, 3) if avg_cell_v > 0 else round(sum(all_cells) / len(all_cells), 3),
-                    "volt_delta": round((max(all_cells) - min(all_cells)) * 1000, 1) if all_cells else 0,
-                    "cell_count": len(all_cells),
-                    "bank_count": bank_count,
+                    "voltage": pack_voltage,
+                    "current": round(runtime.get("current", 0), 3),
+                    "power": round(pack_voltage * runtime.get("current", 0), 2),
+                    "soc": runtime.get("soc", 0),
+                    "temp1": round(runtime.get("temp1", 0), 1),
+                    "temp2": round(runtime.get("temp2", 0), 1),
+                    "avg_cell_v": round(runtime.get("avg_cell_v", sum(valid_cells) / len(valid_cells)), 3),
+                    "volt_delta": round((max(valid_cells) - min(valid_cells)) * 1000, 1),
+                    "cell_count": len(valid_cells),
+                    "bank_count": 2 if len(valid_cells) > 16 else 1,
                 }
                 
-                for i, v in enumerate(all_cells):
+                for i, v in enumerate(valid_cells):
                     metrics[f"cell_{i+1:02d}_v"] = round(v, 3)
-                
-                # Also add slave cells from frame offsets 32-63 (if present in same frame)
-                # Some firmwares pack all cells in one frame
                 
                 # Validate
                 valid = True
@@ -455,7 +423,7 @@ class SerialPortManager:
                     device_id=port.device_fingerprint,
                     device_type=port.inverter_type,
                     metrics=metrics,
-                    raw_data=all_frames[0][0] if all_frames else b"",
+                    raw_data=master_frame,
                     valid=valid,
                     error=error_msg,
                     health=port.health,
