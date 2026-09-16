@@ -17,13 +17,14 @@ from enum import Enum
 from pathlib import Path
 
 from modbus_handler import ModbusRTU, get_profile, InverterProfile, InverterSimulator
-from jk_bms_handler import (
+from bms_handler import (
     build_query as jk_build_query,
     parse_frame as jk_parse_frame,
     parse_runtime_data as jk_parse_runtime_data,
     parse_config_data as jk_parse_config_data,
     parse_device_info as jk_parse_device_info,
     parse_fault_info as jk_parse_fault_info,
+    build_modbus_trigger as jk_build_modbus_trigger,
     FRAME_RUNTIME_DATA,
     FRAME_CONFIG_READ,
     FRAME_DEVICE_INFO,
@@ -274,7 +275,12 @@ class SerialPortManager:
                 await asyncio.sleep(5)
 
     async def _read_jk_bms(self, device: str, callback: Optional[Callable] = None):
-        """Read from a JK-BMS device using the custom 300-byte 5AA5 frame protocol."""
+        """Read from JK-BMS device(s) using 300-byte 5AA5 frames.
+        
+        For parallel battery setups, the master BMS broadcasts its own data,
+        then queries all slave devices. We collect all frames after a trigger
+        and combine them into a single reading with 32 cells.
+        """
         port = self.ports[device]
         counter = 0
         consecutive_errors = 0
@@ -298,20 +304,49 @@ class SerialPortManager:
                 frame_code = poll_sequence[poll_index % len(poll_sequence)]
                 poll_index += 1
                 
+                # Build and send trigger to master (addr 0x00)
+                # This causes master to broadcast and query slaves
+                trigger = jk_build_modbus_trigger()
+                port.serial_conn.write(trigger)
+                
+                # Wait briefly for master to process
+                await asyncio.sleep(0.05)
+                
+                # Send 5AA5 query to trigger slave responses
                 query = jk_build_query(frame_code, counter)
                 port.serial_conn.write(query)
                 
-                # Wait for response
-                response_data = b""
-                timeout = time.time() + 0.35
-                while self._running and port.is_open and time.time() < timeout:
+                # Wait for ALL frames (master + slaves) over 2 seconds
+                all_frames = []  # List of (raw_bytes, timestamp)
+                deadline = time.time() + 2.0
+                current_frame = b""
+                
+                while self._running and port.is_open and time.time() < deadline:
                     if port.serial_conn.in_waiting > 0:
-                        response_data += port.serial_conn.read(port.serial_conn.in_waiting)
-                        if len(response_data) >= 300:
-                            break
+                        current_frame += port.serial_conn.read(port.serial_conn.in_waiting)
+                        
+                        # Check for complete 300-byte frames
+                        while len(current_frame) >= 300:
+                            # Find frame start (55 AA EB 90)
+                            idx = current_frame.find(b'\x55\xAA\xEB\x90')
+                            if idx == -1:
+                                current_frame = b""
+                                break
+                            if idx > 0:
+                                current_frame = current_frame[idx:]
+                            if len(current_frame) < 300:
+                                break
+                            
+                            frame = current_frame[:300]
+                            current_frame = current_frame[300:]
+                            
+                            parsed = jk_parse_frame(frame)
+                            if parsed:
+                                all_frames.append((frame, time.time()))
+                    
                     await asyncio.sleep(0.005)
                 
-                if len(response_data) < 300:
+                if not all_frames:
                     port.error_count += 1
                     consecutive_errors += 1
                     if consecutive_errors >= max_consecutive_errors:
@@ -319,45 +354,65 @@ class SerialPortManager:
                     await asyncio.sleep(0.1)
                     continue
                 
-                parsed = jk_parse_frame(response_data[:300])
-                if not parsed:
-                    port.error_count += 1
-                    consecutive_errors += 1
-                    if consecutive_errors >= max_consecutive_errors:
-                        port.health = DeviceHealth.ERROR
-                    await asyncio.sleep(0.1)
-                    continue
-                
+                # Parse frames and combine cells from master + slaves
                 metrics = {}
-                data = parsed["data"]
+                all_cells = []
+                avg_cell_v = 0
+                volt_delta = 0
+                total_current = 0
+                total_power = 0
+                soc_values = []
+                temp1_values = []
+                temp2_values = []
+                valid_frame_count = 0
                 
-                if parsed["frame_code"] == FRAME_RUNTIME_DATA:
-                    runtime = jk_parse_runtime_data(data)
-                    metrics = {
-                        "voltage": runtime.get("voltage", 0),
-                        "current": runtime.get("current", 0),
-                        "power": runtime.get("power", 0),
-                        "soc": runtime.get("soc", 0),
-                        "temp1": runtime.get("temp1", 0),
-                        "temp2": runtime.get("temp2", 0),
-                        "avg_cell_v": runtime.get("avg_cell_v", 0),
-                        "volt_delta": runtime.get("volt_delta", 0),
-                        "cell_count": runtime.get("cell_count", 0),
-                    }
-                    for i, v in enumerate(runtime.get("cell_voltages", [])):
-                        metrics[f"cell_{i+1:02d}_v"] = v
+                for frame, ts in all_frames:
+                    parsed = jk_parse_frame(frame)
+                    if not parsed:
+                        continue
+                    
+                    data = parsed["data"]
+                    
+                    if parsed["frame_code"] == FRAME_RUNTIME_DATA:
+                        runtime = jk_parse_runtime_data(data)
+                        cells = runtime.get("cell_voltages", [])
+                        valid_cells = [c for c in cells if c > 0.1]
+                        
+                        if valid_cells:
+                            all_cells.extend(valid_cells)
+                            avg_cell_v = runtime.get("avg_cell_v", avg_cell_v)
+                            volt_delta = max(volt_delta, runtime.get("volt_delta", 0))
+                            total_current += runtime.get("current", 0)
+                            total_power += runtime.get("power", 0)
+                            soc_values.append(runtime.get("soc", 0))
+                            temp1_values.append(runtime.get("temp1", 0))
+                            temp2_values.append(runtime.get("temp2", 0))
+                            valid_frame_count += 1
                 
-                elif parsed["frame_code"] == FRAME_CONFIG_READ:
-                    config = jk_parse_config_data(data)
-                    metrics = {f"cfg_{k}": v for k, v in config.items() if isinstance(v, (int, float))}
+                if not all_cells:
+                    port.error_count += 1
+                    consecutive_errors += 1
+                    if consecutive_errors >= max_consecutive_errors:
+                        port.health = DeviceHealth.ERROR
+                    await asyncio.sleep(0.1)
+                    continue
                 
-                elif parsed["frame_code"] == FRAME_DEVICE_INFO:
-                    info = jk_parse_device_info(data)
-                    metrics = {f"info_{k}": v for k, v in info.items() if isinstance(v, (int, float))}
+                # Build combined metrics for all 32 cells
+                metrics = {
+                    "voltage": round(sum(all_cells), 2),
+                    "current": round(total_current, 3),
+                    "power": round(sum(all_cells) * total_current, 2),
+                    "soc": round(sum(soc_values) / len(soc_values)) if soc_values else 0,
+                    "temp1": round(max(temp1_values) if temp1_values else 0, 1),
+                    "temp2": round(max(temp2_values) if temp2_values else 0, 1),
+                    "avg_cell_v": round(avg_cell_v, 3) if avg_cell_v > 0 else round(sum(all_cells) / len(all_cells), 3),
+                    "volt_delta": round((max(all_cells) - min(all_cells)) * 1000, 1) if all_cells else 0,
+                    "cell_count": len(all_cells),
+                    "bank_count": valid_frame_count,
+                }
                 
-                elif parsed["frame_code"] == FRAME_FAULT_INFO:
-                    faults = jk_parse_fault_info(data)
-                    metrics = {f"fault_{k}": v for k, v in faults.items() if isinstance(v, (int, float))}
+                for i, v in enumerate(all_cells):
+                    metrics[f"cell_{i+1:02d}_v"] = round(v, 3)
                 
                 # Validate
                 valid = True
@@ -382,7 +437,7 @@ class SerialPortManager:
                     device_id=port.device_fingerprint,
                     device_type=port.inverter_type,
                     metrics=metrics,
-                    raw_data=response_data[:300],
+                    raw_data=all_frames[0][0] if all_frames else b"",
                     valid=valid,
                     error=error_msg,
                     health=port.health,
