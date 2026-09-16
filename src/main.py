@@ -33,11 +33,17 @@ logger = logging.getLogger(__name__)
 
 ENABLE_WRITES = os.environ.get("ENABLE_WRITES", "false").lower() == "true"
 
+# Project paths - works regardless of working directory
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_TEMPLATE_DIR = _PROJECT_ROOT / "templates"
+_STATIC_DIR = _PROJECT_ROOT / "static"
+_DB_PATH = _PROJECT_ROOT / "database" / "solar.db"
+
 serial_manager = SerialPortManager()
-db = SolarDatabase()
+db = SolarDatabase(db_path=str(_DB_PATH))
 automation_engine = AutomationEngine()
 
-DASHBOARD_DIR = Path(__file__).resolve().parent.parent / "templates"
+DASHBOARD_DIR = _TEMPLATE_DIR
 
 
 def handle_automation_action(action: Dict):
@@ -107,9 +113,8 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Solar Monitor", version="2.0.0", lifespan=lifespan)
 
 # Mount static files
-static_dir = Path(__file__).parent.parent / "static"
-if static_dir.exists():
-    app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+if _STATIC_DIR.exists():
+    app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
 
 # ─── REST API ───────────────────────────────────────────────
 

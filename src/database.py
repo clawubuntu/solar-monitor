@@ -10,8 +10,11 @@ from pathlib import Path
 
 
 class SolarDatabase:
-    def __init__(self, db_path: str = "database/solar.db"):
-        self.db_path = Path(db_path)
+    def __init__(self, db_path: Optional[str] = None):
+        if db_path:
+            self.db_path = Path(db_path)
+        else:
+            self.db_path = Path(__file__).resolve().parent.parent / "database" / "solar.db"
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.init_db()
 

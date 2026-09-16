@@ -96,14 +96,20 @@ class InverterReading:
 
 
 class SerialPortManager:
-    def __init__(self, data_dir: str = "database"):
+    def __init__(self, data_dir: Optional[str] = None):
         self.ports: Dict[str, SerialPort] = {}
         self.readings: List[InverterReading] = []
         self.max_history = 100000
         self._callbacks: List[Callable] = []
         self._running = False
         self._tasks: Dict[str, asyncio.Task] = {}
-        self._data_dir = Path(data_dir)
+        
+        # Use absolute path based on project root
+        if data_dir:
+            self._data_dir = Path(data_dir)
+        else:
+            self._data_dir = Path(__file__).resolve().parent.parent / "database"
+        
         self._data_dir.mkdir(parents=True, exist_ok=True)
         self._simulators: Dict[str, InverterSimulator] = {}
         self._load_state()
