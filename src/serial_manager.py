@@ -355,8 +355,10 @@ class SerialPortManager:
                     continue
                 
                 # Parse frames and combine cells from master + slaves
+                # Master frame has cells 1-16, slave frames have cells 17-32
                 metrics = {}
-                all_cells = []
+                master_cells = []
+                slave_cells = []
                 avg_cell_v = 0
                 volt_delta = 0
                 total_current = 0
@@ -364,32 +366,37 @@ class SerialPortManager:
                 soc_values = []
                 temp1_values = []
                 temp2_values = []
-                valid_frame_count = 0
+                bank_count = 0
                 
                 for frame, ts in all_frames:
                     parsed = jk_parse_frame(frame)
-                    if not parsed:
+                    if not parsed or parsed["frame_code"] != FRAME_RUNTIME_DATA:
                         continue
                     
                     data = parsed["data"]
+                    runtime = jk_parse_runtime_data(data)
+                    cells = runtime.get("cell_voltages", [])
+                    valid_cells = [c for c in cells if c > 0.1]
                     
-                    if parsed["frame_code"] == FRAME_RUNTIME_DATA:
-                        runtime = jk_parse_runtime_data(data)
-                        cells = runtime.get("cell_voltages", [])
-                        valid_cells = [c for c in cells if c > 0.1]
-                        
-                        if valid_cells:
-                            all_cells.extend(valid_cells)
-                            avg_cell_v = runtime.get("avg_cell_v", avg_cell_v)
-                            volt_delta = max(volt_delta, runtime.get("volt_delta", 0))
-                            total_current += runtime.get("current", 0)
-                            total_power += runtime.get("power", 0)
-                            soc_values.append(runtime.get("soc", 0))
-                            temp1_values.append(runtime.get("temp1", 0))
-                            temp2_values.append(runtime.get("temp2", 0))
-                            valid_frame_count += 1
+                    if not valid_cells:
+                        continue
+                    
+                    # First frame is master (address 0x00), rest are slaves
+                    if bank_count == 0:
+                        master_cells = valid_cells
+                    else:
+                        slave_cells.extend(valid_cells)
+                    
+                    avg_cell_v = runtime.get("avg_cell_v", avg_cell_v)
+                    volt_delta = max(volt_delta, runtime.get("volt_delta", 0))
+                    total_current += runtime.get("current", 0)
+                    total_power += runtime.get("power", 0)
+                    soc_values.append(runtime.get("soc", 0))
+                    temp1_values.append(runtime.get("temp1", 0))
+                    temp2_values.append(runtime.get("temp2", 0))
+                    bank_count += 1
                 
-                if not all_cells:
+                if not master_cells:
                     port.error_count += 1
                     consecutive_errors += 1
                     if consecutive_errors >= max_consecutive_errors:
@@ -397,18 +404,13 @@ class SerialPortManager:
                     await asyncio.sleep(0.1)
                     continue
                 
-                # For parallel banks: voltage = average, current = sum
-                bank_voltages = []
-                for frame, ts in all_frames:
-                    parsed = jk_parse_frame(frame)
-                    if not parsed or parsed["frame_code"] != FRAME_RUNTIME_DATA:
-                        continue
-                    runtime = jk_parse_runtime_data(parsed["data"])
-                    cells = [c for c in runtime.get("cell_voltages", []) if c > 0.1]
-                    if cells:
-                        bank_voltages.append(sum(cells))
+                all_cells = master_cells + slave_cells
                 
-                avg_voltage = round(sum(bank_voltages) / len(bank_voltages), 2) if bank_voltages else 0
+                # For parallel banks: voltage = average, current = sum
+                bank_voltages = [sum(master_cells)]
+                if slave_cells:
+                    bank_voltages.append(sum(slave_cells))
+                avg_voltage = round(sum(bank_voltages) / len(bank_voltages), 2)
                 
                 # Build combined metrics
                 metrics = {
@@ -421,11 +423,14 @@ class SerialPortManager:
                     "avg_cell_v": round(avg_cell_v, 3) if avg_cell_v > 0 else round(sum(all_cells) / len(all_cells), 3),
                     "volt_delta": round((max(all_cells) - min(all_cells)) * 1000, 1) if all_cells else 0,
                     "cell_count": len(all_cells),
-                    "bank_count": valid_frame_count,
+                    "bank_count": bank_count,
                 }
                 
                 for i, v in enumerate(all_cells):
                     metrics[f"cell_{i+1:02d}_v"] = round(v, 3)
+                
+                # Also add slave cells from frame offsets 32-63 (if present in same frame)
+                # Some firmwares pack all cells in one frame
                 
                 # Validate
                 valid = True

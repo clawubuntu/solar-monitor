@@ -35,12 +35,13 @@ def parse_frame(frame:bytes)->Optional[Dict]:
     if frame[299]!=calculate_checksum(frame):return None
     return{"frame_code":frame[4],"frame_name":FRAME_NAMES.get(frame[4],"Unknown"),"counter":frame[5],"data":frame[6:299]}
 
-def parse_runtime_data(data:bytes)->Dict:
+def parse_runtime_data(data: bytes) -> Dict:
     """Parse runtime frame 0x02 for JK-PB V19 (firmware V19.09).
     
-    Verified offsets from live capture:
-      [0:32]   Cell voltages 1-16: u16 LE, ×0.001V
-      [32:64]  Cell voltages 17-32: u16 LE, ×0.001V (0 if unused)
+    The master BMS frame contains cell data for all connected slaves.
+    Layout:
+      [0:32]   Cell voltages 1-16 (master): u16 LE, ×0.001V
+      [32:64]  Cell voltages 17-32 (slave): u16 LE, ×0.001V
       [64:66]  Delimiter: 0xFFFF
       [68:70]  Avg cell voltage: u16 LE, ×0.001V
       [70:72]  Cell delta: u16 LE, ×0.001V
@@ -48,18 +49,17 @@ def parse_runtime_data(data:bytes)->Dict:
       [74:76]  SOC: u16 LE, %
       [86:88]  Temp1: i16 LE, ×0.1°C
       [88:90]  Temp2: i16 LE, ×0.1°C
-    Pack voltage = sum of valid cell voltages.
     """
     r = {}
     
-    # Cell voltages 1-16
+    # Cell voltages 1-16 (master battery)
     cells = []
     for i in range(16):
         raw = struct.unpack_from('<H', data, i * 2)[0]
         cells.append(round(raw * 0.001, 3))
     r['cell_voltages'] = cells
     
-    # Cell voltages 17-32 (unused in 16-cell packs)
+    # Cell voltages 17-32 (slave batteries, if present in same frame)
     cells_17_32 = []
     for i in range(16, 32):
         raw = struct.unpack_from('<H', data, i * 2)[0]
@@ -82,15 +82,16 @@ def parse_runtime_data(data:bytes)->Dict:
     r['temp1'] = struct.unpack_from('<h', data, 86)[0] * 0.1
     r['temp2'] = struct.unpack_from('<h', data, 88)[0] * 0.1
     
-    # Pack voltage = sum of valid cells
+    # Pack voltage = sum of valid cell voltages
     valid_cells = [c for c in cells if c > 0.1]
     r['pack_v'] = round(sum(valid_cells), 2)
     
     # Power
     r['power'] = round(r['pack_v'] * r['current'], 2)
     
-    # Cell count
-    r['cell_count'] = len(valid_cells)
+    # Total cell count = master + slave cells
+    total_cells = valid_cells + [c for c in cells_17_32 if c > 0.1]
+    r['cell_count'] = len(total_cells)
     
     # Alias for API compatibility
     r['voltage'] = r['pack_v']
